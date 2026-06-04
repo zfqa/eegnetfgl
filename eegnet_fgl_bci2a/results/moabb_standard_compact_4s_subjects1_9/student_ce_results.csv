@@ -1,0 +1,10 @@
+method,subject,window,accuracy,macro_f1,kappa,best_epoch,seed,protocol,fmin,fmax,tmin,tmax,diffusion_ratio,diffusion_type,diffusion_task,diffusion_fusion_lambda,mask_ratio,mask_mode,mask_block_ratio,imputation_sampling_mode,imputation_loss_scope,synthetic_samples,real_train_samples,total_train_samples,diffusion_imputation_mask_mean,diffusion_desam_temporal_mixup,diffusion_imputation_sampling_desam,diffusion_imputation_loss_full
+EEGNet-CE,1,4.0,0.7326388888888888,0.7313397129186603,0.6435185185185186,118,42,moabb_standard,8.0,32.0,0.0,4.0,0.0,conditional,imputation,0.8,0.5,temporal,0.1,desam,full,0,230,230,,0,0,0
+EEGNet-CE,2,4.0,0.4722222222222222,0.442931738240758,0.2962962962962963,107,42,moabb_standard,8.0,32.0,0.0,4.0,0.0,conditional,imputation,0.8,0.5,temporal,0.1,desam,full,0,230,230,,0,0,0
+EEGNet-CE,3,4.0,0.84375,0.8392927384167435,0.7916666666666666,226,42,moabb_standard,8.0,32.0,0.0,4.0,0.0,conditional,imputation,0.8,0.5,temporal,0.1,desam,full,0,230,230,,0,0,0
+EEGNet-CE,4,4.0,0.4826388888888889,0.4795599137704401,0.3101851851851852,94,42,moabb_standard,8.0,32.0,0.0,4.0,0.0,conditional,imputation,0.8,0.5,temporal,0.1,desam,full,0,230,230,,0,0,0
+EEGNet-CE,5,4.0,0.3125,0.3051533805938233,0.0833333333333333,7,42,moabb_standard,8.0,32.0,0.0,4.0,0.0,conditional,imputation,0.8,0.5,temporal,0.1,desam,full,0,230,230,,0,0,0
+EEGNet-CE,6,4.0,0.3402777777777778,0.3349109997877952,0.1203703703703703,26,42,moabb_standard,8.0,32.0,0.0,4.0,0.0,conditional,imputation,0.8,0.5,temporal,0.1,desam,full,0,230,230,,0,0,0
+EEGNet-CE,7,4.0,0.6145833333333334,0.5868640521817845,0.4861111111111111,195,42,moabb_standard,8.0,32.0,0.0,4.0,0.0,conditional,imputation,0.8,0.5,temporal,0.1,desam,full,0,230,230,,0,0,0
+EEGNet-CE,8,4.0,0.7291666666666666,0.7315558834460694,0.6388888888888888,68,42,moabb_standard,8.0,32.0,0.0,4.0,0.0,conditional,imputation,0.8,0.5,temporal,0.1,desam,full,0,230,230,,0,0,0
+EEGNet-CE,9,4.0,0.75,0.736153940549308,0.6666666666666667,191,42,moabb_standard,8.0,32.0,0.0,4.0,0.0,conditional,imputation,0.8,0.5,temporal,0.1,desam,full,0,230,230,,0,0,0

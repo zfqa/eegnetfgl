@@ -1,0 +1,33 @@
+data:
+  fmin: 4
+  fmax: 38
+  tmin: 0
+  tmax: 4
+  fs: 250
+  val_ratio: 0.2
+
+experiment:
+  subjects: [1]
+  windows: [0.5, 1.0, 2.0]
+  seed: 42
+
+training:
+  epochs: 300
+  batch_size: 32
+  lr: 0.001
+  weight_decay: 0.0001
+  patience: 100
+  device: cuda
+
+distillation:
+  alpha: 0.5
+  temperature: 4.0
+  mode: online
+
+model:
+  n_classes: 4
+  dropout_rate: 0.5
+  F1: 8
+  D: 2
+  F2: 16
+  kernel_length: 64

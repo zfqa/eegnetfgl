@@ -1,0 +1,13 @@
+torch
+torchvision
+torchaudio
+moabb
+mne
+numpy
+scipy
+pandas
+scikit-learn
+pyriemann
+matplotlib
+pyyaml
+tqdm
