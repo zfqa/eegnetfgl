@@ -17,6 +17,7 @@ from pyriemann.tangentspace import TangentSpace
 from utils.data_loader import (
     crop_time_window,
     load_bci2a_subject,
+    load_bci2b_subject,
     split_session_train_val_test,
     standardize_by_train,
 )
@@ -27,8 +28,9 @@ from utils.train_utils import append_or_update_csv, metric_row
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Paper-grade Riemannian baselines for BNCI2014_001.")
+    parser = argparse.ArgumentParser(description="Paper-grade Riemannian baselines for BCI Competition IV 2a/2b.")
     parser.add_argument("--subject", type=int, default=1)
+    parser.add_argument("--dataset", type=str, default="bci2a", choices=["bci2a", "bci2b"])
     parser.add_argument("--window", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_dir", type=str, default="results/riemann_paper")
@@ -207,11 +209,22 @@ def row_exists(csv_path: Path, args: argparse.Namespace, method: str, estimator:
     import pandas as pd
 
     df = pd.read_csv(csv_path)
-    required = {"method", "subject", "window", "seed", "classifier", "cov_estimator", "alignment", "metric"}
+    required = {
+        "method",
+        "dataset",
+        "subject",
+        "window",
+        "seed",
+        "classifier",
+        "cov_estimator",
+        "alignment",
+        "metric",
+    }
     if not required.issubset(df.columns):
         return False
     mask = (
         (df["method"].astype(str) == method_display_name(method))
+        & (df["dataset"].astype(str) == args.dataset)
         & (df["subject"].astype(int) == int(args.subject))
         & np.isclose(df["window"].astype(float), float(args.window))
         & (df["seed"].astype(int) == int(args.seed))
@@ -230,7 +243,8 @@ def main() -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
     csv_path = save_dir / "riemann_paper_results.csv"
 
-    X, y, metadata = load_bci2a_subject(
+    loader = load_bci2b_subject if args.dataset == "bci2b" else load_bci2a_subject
+    X, y, metadata = loader(
         args.subject,
         fmin=args.fmin,
         fmax=args.fmax,
@@ -249,7 +263,7 @@ def main() -> None:
     X_test = normalize_trials_by_trace(X_test)
 
     print(
-        f"Subject {args.subject} paper-grade Riemann window={args.window:g}s: "
+        f"{args.dataset} subject {args.subject} paper-grade Riemann window={args.window:g}s: "
         f"train={len(y_train)}, val={len(y_val)}, test={len(y_test)}, shape={X_train.shape[1:]}"
     )
     print("All references, alignments, tangent projections, and hyperparameters are fitted on train/val only.")
@@ -308,6 +322,7 @@ def main() -> None:
                 )
                 row = metric_row(
                     method=method_display_name(method),
+                    dataset=args.dataset,
                     subject=args.subject,
                     window=args.window,
                     metrics=test_metrics,
@@ -331,6 +346,7 @@ def main() -> None:
                     row,
                     key_columns=[
                         "method",
+                        "dataset",
                         "subject",
                         "window",
                         "seed",

@@ -260,3 +260,47 @@ The scripts expose `--alpha` and `--temperature`, so later ablations can run val
 - Student test uses only early EEG windows and never uses the teacher.
 - Teacher, CE student, and FGL student must use the same subject, seed, and validation ratio to keep splits aligned.
 - The test session is never used for model selection.
+
+## Paper Experiment Matrix
+
+The paper-facing matrix uses the MOABB-standard BNCI2014_001 protocol:
+MotorImagery, 8-32 Hz, 0-4 s, 250 Hz, session-based train/evaluation split,
+and train-only standardization.
+
+Run the full multi-seed matrix:
+
+```bash
+python run_paper_experiment_matrix.py --subjects 1 2 3 4 5 6 7 8 9 --seeds 42 2024 3407 7 123 --groups all --root_dir results/paper_moabb_multiseed --epochs 300 --teacher_epochs 300 --eegnetv4_epochs 300 --batch_size 32 --lr 0.001 --device cuda
+```
+
+For staged execution:
+
+```bash
+python run_paper_experiment_matrix.py --groups teachers ce --subjects 1 2 3 4 5 6 7 8 9 --seeds 42 2024 3407 7 123
+python run_paper_experiment_matrix.py --groups dual_ablation riemann_guided --subjects 1 2 3 4 5 6 7 8 9 --seeds 42 2024 3407 7 123
+python run_paper_experiment_matrix.py --groups eegnetv4 baselines --subjects 1 2 3 4 5 6 7 8 9 --seeds 42 2024 3407 7 123
+```
+
+The matrix covers:
+
+- Compact EEGNet 2s/4s CE.
+- EEGNetV4 2s/4s.
+- EEGNet teacher KD, Riemann teacher KD, and dual KD.
+- Riemann spatial-only, Riemann KD + spatial, Riemann KD + geometry, and Riemann KD + geometry + spatial.
+- Riemann MDM, Riemann tangent-space LogReg, and CSP + LDA.
+
+Aggregate results, run paired significance tests, and generate figures:
+
+```bash
+python analyze_paper_results.py --results_roots results/paper_moabb_multiseed --output_dir results/paper_analysis --baseline_label "Compact EEGNet 2s" --mainline_label "Riemann-guided dual KD 2s"
+```
+
+Main outputs:
+
+- `results/paper_analysis/paper_long_results.csv`
+- `results/paper_analysis/paper_summary_by_method.csv`
+- `results/paper_analysis/paper_paired_significance_tests.csv`
+- `results/paper_analysis/paper_subject_seed_accuracy_pivot.csv`
+- `results/paper_analysis/method_mean_accuracy_bar.png`
+- `results/paper_analysis/subject_improvement_mainline_vs_baseline.png`
+- `results/paper_analysis/riemann_val_vs_student_test_scatter.png`

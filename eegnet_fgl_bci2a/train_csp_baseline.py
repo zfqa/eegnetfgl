@@ -14,7 +14,13 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from utils.data_loader import crop_time_window, load_bci2a_subject, split_session_train_val_test, standardize_by_train
+from utils.data_loader import (
+    crop_time_window,
+    load_bci2a_subject,
+    load_bci2b_subject,
+    split_session_train_val_test,
+    standardize_by_train,
+)
 from utils.metrics import evaluate_metrics
 from utils.seed import set_seed
 from utils.train_utils import append_or_update_csv, metric_row
@@ -46,8 +52,9 @@ class Candidate:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train CSP/FBCSP baselines for BNCI2014_001.")
+    parser = argparse.ArgumentParser(description="Train CSP/FBCSP baselines for BCI Competition IV 2a/2b.")
     parser.add_argument("--subject", type=int, default=1)
+    parser.add_argument("--dataset", type=str, default="bci2a", choices=["bci2a", "bci2b"])
     parser.add_argument("--window", type=float, default=4.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_dir", type=str, default="results/csp_baseline")
@@ -153,6 +160,7 @@ def reg_label(reg: str | float | None) -> str:
 
 
 def load_split(
+    dataset: str,
     subject: int,
     fmin: float,
     fmax: float,
@@ -163,7 +171,8 @@ def load_split(
     val_ratio: float,
     seed: int,
 ) -> SplitData:
-    X, y, metadata = load_bci2a_subject(subject, fmin=fmin, fmax=fmax, tmin=tmin, tmax=tmax)
+    loader = load_bci2b_subject if dataset == "bci2b" else load_bci2a_subject
+    X, y, metadata = loader(subject, fmin=fmin, fmax=fmax, tmin=tmin, tmax=tmax)
     X_train, y_train, X_val, y_val, X_test, y_test = split_session_train_val_test(
         X, y, metadata, val_ratio=val_ratio, seed=seed
     )
@@ -481,6 +490,7 @@ def write_result(
 ) -> None:
     row = metric_row(
         method=result.method,
+        dataset=args.dataset,
         subject=args.subject,
         window=args.window,
         metrics=result.test_metrics,
@@ -508,6 +518,7 @@ def write_result(
     )
     key_columns = [
         "method",
+        "dataset",
         "subject",
         "window",
         "seed",
@@ -544,13 +555,14 @@ def main() -> None:
     csv_path = save_dir / "csp_baseline_results.csv"
 
     print(
-        f"Subject {args.subject} CSP/FBCSP baselines window={args.window:g}s: "
+        f"{args.dataset} subject {args.subject} CSP/FBCSP baselines window={args.window:g}s: "
         f"methods={','.join(methods)}, final_train={'train+val' if args.use_train_val else 'train'}"
     )
 
     base_split: SplitData | None = None
     if any(method.startswith("csp") for method in methods):
         base_split = load_split(
+            args.dataset,
             args.subject,
             args.fmin,
             args.fmax,
@@ -571,6 +583,7 @@ def main() -> None:
         band_splits = []
         for low, high in bands:
             split = load_split(
+                args.dataset,
                 args.subject,
                 low,
                 high,
@@ -599,6 +612,7 @@ def main() -> None:
         }[method]
         criteria = {
             "method": method_name,
+            "dataset": args.dataset,
             "subject": args.subject,
             "window": args.window,
             "seed": args.seed,

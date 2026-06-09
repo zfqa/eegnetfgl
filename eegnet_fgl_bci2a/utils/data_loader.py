@@ -25,6 +25,19 @@ MOABB_BCI2A_STANDARD_PROTOCOL = {
     "n_classes": 4,
 }
 
+MOABB_BCI2B_STANDARD_PROTOCOL = {
+    "dataset": "BNCI2014_004",
+    "paradigm": "MotorImagery",
+    "evaluation": "cross_session",
+    "fmin": 8.0,
+    "fmax": 32.0,
+    "tmin": 0.0,
+    "tmax": 4.0,
+    "fs": 250,
+    "n_channels": 3,
+    "n_classes": 2,
+}
+
 
 LABEL_MAP = {
     "left_hand": 0,
@@ -68,7 +81,7 @@ def _labels_to_int(y: np.ndarray) -> np.ndarray:
     if np.issubdtype(y.dtype, np.number):
         y_int = y.astype(np.int64)
         unique = set(np.unique(y_int).tolist())
-        if unique == {1, 2, 3, 4}:
+        if unique == set(range(1, len(unique) + 1)):
             y_int = y_int - 1
         return y_int
 
@@ -79,6 +92,43 @@ def _labels_to_int(y: np.ndarray) -> np.ndarray:
             raise ValueError(f"Unknown class label from MOABB: {label!r}")
         mapped.append(LABEL_MAP[name])
     return np.asarray(mapped, dtype=np.int64)
+
+
+def load_moabb_mi_subject(
+    dataset_name: str,
+    subject_id: int,
+    n_classes: int,
+    fmin: float = 4,
+    fmax: float = 38,
+    tmin: float = 0,
+    tmax: float = 4,
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """Load a MOABB motor-imagery subject as [trials, channels, samples]."""
+
+    configure_mne_data_path()
+
+    try:
+        from moabb import datasets as moabb_datasets
+        from moabb.paradigms import MotorImagery
+    except ImportError as exc:
+        raise RuntimeError(
+            f"MOABB is required to load {dataset_name}. Install dependencies with "
+            "`pip install -r requirements.txt`."
+        ) from exc
+
+    if not hasattr(moabb_datasets, dataset_name):
+        raise ValueError(f"Unsupported MOABB dataset: {dataset_name}")
+    dataset_cls = getattr(moabb_datasets, dataset_name)
+    dataset = dataset_cls()
+    paradigm = MotorImagery(n_classes=n_classes, fmin=fmin, fmax=fmax, tmin=tmin, tmax=tmax)
+    X, labels, metadata = paradigm.get_data(dataset=dataset, subjects=[subject_id])
+    X = np.asarray(X, dtype=np.float32)
+    if X.ndim != 3:
+        raise ValueError(f"Expected MOABB X shape [trials, channels, samples], got {X.shape}")
+    if "session" not in metadata.columns:
+        raise ValueError("MOABB metadata must contain a 'session' column.")
+    y = _labels_to_int(labels)
+    return X, y, metadata.reset_index(drop=True)
 
 
 def load_bci2a_subject(
@@ -100,27 +150,35 @@ def load_bci2a_subject(
         MOABB metadata including the session column used for splitting.
     """
 
-    configure_mne_data_path()
+    return load_moabb_mi_subject(
+        "BNCI2014_001",
+        subject_id,
+        n_classes=4,
+        fmin=fmin,
+        fmax=fmax,
+        tmin=tmin,
+        tmax=tmax,
+    )
 
-    try:
-        from moabb.datasets import BNCI2014_001
-        from moabb.paradigms import MotorImagery
-    except ImportError as exc:
-        raise RuntimeError(
-            "MOABB is required to load BNCI2014_001. Install dependencies with "
-            "`pip install -r requirements.txt`."
-        ) from exc
 
-    dataset = BNCI2014_001()
-    paradigm = MotorImagery(n_classes=4, fmin=fmin, fmax=fmax, tmin=tmin, tmax=tmax)
-    X, labels, metadata = paradigm.get_data(dataset=dataset, subjects=[subject_id])
-    X = np.asarray(X, dtype=np.float32)
-    if X.ndim != 3:
-        raise ValueError(f"Expected MOABB X shape [trials, channels, samples], got {X.shape}")
-    if "session" not in metadata.columns:
-        raise ValueError("MOABB metadata must contain a 'session' column.")
-    y = _labels_to_int(labels)
-    return X, y, metadata.reset_index(drop=True)
+def load_bci2b_subject(
+    subject_id: int,
+    fmin: float = 4,
+    fmax: float = 38,
+    tmin: float = 0,
+    tmax: float = 4,
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """Load one BNCI2014_004 / BCI Competition IV 2b subject with MOABB."""
+
+    return load_moabb_mi_subject(
+        "BNCI2014_004",
+        subject_id,
+        n_classes=2,
+        fmin=fmin,
+        fmax=fmax,
+        tmin=tmin,
+        tmax=tmax,
+    )
 
 
 def apply_bci2a_protocol_defaults(protocol: str) -> dict[str, float | int | str]:
@@ -192,6 +250,26 @@ def _pick_train_test_sessions(session_values: pd.Series) -> _SessionSplit:
     return _SessionSplit(unique[0], unique[1])
 
 
+def _pick_train_test_session_groups(session_values: pd.Series) -> tuple[list[str], list[str]]:
+    unique = list(pd.unique(session_values.astype(str)))
+    if len(unique) < 2:
+        raise ValueError(f"Expected at least two sessions, got {unique}")
+
+    def has_any(value: str, tokens: tuple[str, ...]) -> bool:
+        lower = value.lower()
+        return any(token in lower for token in tokens)
+
+    train_tokens = ("train", "session_t", "_t", "0train", "1train", "2train")
+    test_tokens = ("test", "eval", "session_e", "_e", "3test", "4test")
+    train_matches = [v for v in unique if has_any(v, train_tokens)]
+    test_matches = [v for v in unique if has_any(v, test_tokens)]
+    if train_matches and test_matches:
+        return train_matches, test_matches
+
+    sessions = _pick_train_test_sessions(session_values)
+    return [sessions.train_session], [sessions.test_session]
+
+
 def split_session_train_val_test(
     X: np.ndarray,
     y: np.ndarray,
@@ -207,16 +285,16 @@ def split_session_train_val_test(
         raise ValueError("X, y, and metadata must have the same number of trials.")
 
     session_strings = metadata["session"].astype(str).reset_index(drop=True)
-    sessions = _pick_train_test_sessions(session_strings)
-    train_val_mask = session_strings == sessions.train_session
-    test_mask = session_strings == sessions.test_session
+    train_sessions, test_sessions = _pick_train_test_session_groups(session_strings)
+    train_val_mask = session_strings.isin(train_sessions)
+    test_mask = session_strings.isin(test_sessions)
     train_val_indices = np.where(train_val_mask.to_numpy())[0]
     test_indices = np.where(test_mask.to_numpy())[0]
 
     if len(train_val_indices) == 0 or len(test_indices) == 0:
         raise ValueError(
-            f"Could not split sessions. train={sessions.train_session}, "
-            f"test={sessions.test_session}, available={list(pd.unique(session_strings))}"
+            f"Could not split sessions. train={train_sessions}, "
+            f"test={test_sessions}, available={list(pd.unique(session_strings))}"
         )
 
     train_indices, val_indices = train_test_split(

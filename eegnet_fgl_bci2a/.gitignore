@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .idea/
+~$*.docx
 
 # MOABB/MNE downloads can be large. Keep them local, not in version control.
 data/mne_data/
