@@ -34,10 +34,8 @@ DEFAULT_DETECTOR = (
     "subject_1/eegnetv4_05s_sliding_detector_best.pth"
 )
 DEFAULT_TEACHER = (
-    "results/bci2b_eegnetv4_4s_teachers_seed42/"
-    "bci2b_subject_1_eegnetv4_window_4_riemwin_4_seed_42_"
-    "eegkd_0_riekd_0_geo_0_supcon_0_spatial_0_filter_corr_sample_"
-    "geom_cosine_none_k_8_gt_1_gate_confidence_normalized_0_shrink_0.001_best.pth"
+    "results/unified_teachers/bci2b/seed_42/"
+    "bci2b_subject_1_compact_teacher_best.pth"
 )
 
 

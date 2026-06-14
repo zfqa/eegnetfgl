@@ -35,10 +35,8 @@ foreach ($subject in $Subjects) {
         "subject_${subject}\eegnetv4_05s_sliding_detector_best.pth"
     )
     $teacher = (
-        "results\bci2b_eegnetv4_4s_teachers_seed42\" +
-        "bci2b_subject_${subject}_eegnetv4_window_4_riemwin_4_seed_${Seed}_" +
-        "eegkd_0_riekd_0_geo_0_supcon_0_spatial_0_filter_corr_sample_" +
-        "geom_cosine_none_k_8_gt_1_gate_confidence_normalized_0_shrink_0.001_best.pth"
+        "results\unified_teachers\bci2b\seed_${Seed}\" +
+        "bci2b_subject_${subject}_compact_teacher_best.pth"
     )
     if (-not (Test-Path -LiteralPath $detector)) {
         throw "Detector not found: $detector"

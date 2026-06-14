@@ -47,7 +47,7 @@ def unified_teacher_path(root: Path, dataset: str, subject: int, seed: int) -> P
     if dataset == "bci2a":
         name = f"subject_{subject}_teacher_best.pth"
     else:
-        name = f"bci2b_subject_{subject}_eegnetv4_teacher_best.pth"
+        name = f"bci2b_subject_{subject}_compact_teacher_best.pth"
     path = root / dataset / f"seed_{seed}" / name
     if not path.exists():
         raise FileNotFoundError(

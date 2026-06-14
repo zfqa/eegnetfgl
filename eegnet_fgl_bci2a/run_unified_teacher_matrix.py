@@ -42,7 +42,7 @@ def main() -> None:
 
     root = Path(args.root_dir)
     for dataset in args.datasets:
-        model_variant = "compact" if dataset == "bci2a" else "eegnetv4"
+        model_variant = "compact"
         for seed in args.seeds:
             save_dir = root / dataset / f"seed_{seed}"
             save_dir.mkdir(parents=True, exist_ok=True)

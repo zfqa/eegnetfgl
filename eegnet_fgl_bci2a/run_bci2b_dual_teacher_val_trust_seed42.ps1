@@ -6,14 +6,14 @@ $env:MNE_DONTWRITE_HOME = "true"
 
 $python = "D:\anaconda\envs\eeg_fgl\python.exe"
 $script = "train_student_riemann_guided.py"
-$teacherDir = "results\bci2b_eegnetv4_4s_teachers_seed42"
+$teacherDir = "results\unified_teachers\bci2b\seed_42"
 $saveDir = "results\bci2b_compact_2s_dual_teacher_val_trust_seed42"
 
 foreach ($subject in 1..9) {
-    $teacher = Get-ChildItem -LiteralPath $teacherDir -Filter "bci2b_subject_${subject}_eegnetv4_window_4_*_best.pth" |
+    $teacher = Get-ChildItem -LiteralPath $teacherDir -Filter "bci2b_subject_${subject}_compact_*_best.pth" |
         Select-Object -First 1
     if ($null -eq $teacher) {
-        throw "Teacher checkpoint was not found for subject $subject."
+        throw "Teacher checkpoint was not found for subject $subject in $teacherDir."
     }
 
     Write-Output "=== Subject ${subject}: validation-trusted dual teacher KD ==="

@@ -169,11 +169,11 @@ foreach ($seed in $Seeds) {
 
     foreach ($subject in $Subjects) {
         Invoke-GuidedRun $subject $seed $teacherDir $searchDirs `
-            "EEGNetV4 4s teacher/upper bound" "eegnetv4" 4.0 0.0 0.0 0.0
+            "Compact 4s teacher/upper bound" "compact" 4.0 0.0 0.0 0.0
 
-        $teacher = Join-Path (Join-Path $TeacherRoot "seed_$seed") "bci2b_subject_${subject}_eegnetv4_teacher_best.pth"
+        $teacher = Join-Path (Join-Path $TeacherRoot "seed_$seed") "bci2b_subject_${subject}_compact_teacher_best.pth"
         if (-not (Test-Path -LiteralPath $teacher)) {
-            throw "Validated EEGNetV4 teacher not found: $teacher. Run run_unified_teacher_matrix.py first."
+            throw "Validated compact teacher not found: $teacher. Run run_unified_teacher_matrix.py first."
         }
 
         Invoke-GuidedRun $subject $seed $studentDir $searchDirs `

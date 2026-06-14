@@ -122,24 +122,27 @@ def bci2b_teacher(root: str | Path, seed: int, subject: int) -> Path:
         Path(root)
         / "bci2b"
         / f"seed_{seed}"
-        / f"bci2b_subject_{subject}_eegnetv4_teacher_best.pth"
+        / f"bci2b_subject_{subject}_compact_teacher_best.pth"
     )
     if unified.exists():
         return unified
     search_dirs = [
+        Path("results/unified_teachers/bci2b") / f"seed_{seed}",
         Path("results/bci2b_paper_multiseed") / f"seed_{seed}" / "eegnetv4_4s_teacher",
     ]
     if seed == 42:
         search_dirs.append(Path("results/bci2b_eegnetv4_4s_teachers_seed42"))
 
-    pattern = (
-        f"bci2b_subject_{subject}_eegnetv4_window_4_riemwin_4_seed_{seed}_"
-        "eegkd_0_riekd_0_geo_0_supcon_0_*_best.pth"
-    )
-    candidates = [path for directory in search_dirs for path in sorted(directory.glob(pattern))]
-    if not candidates:
-        raise FileNotFoundError(
-            f"BCI IV-2b EEGNetV4 teacher checkpoint not found for seed={seed}, subject={subject}."
+    for d in search_dirs:
+        compact = sorted(d.glob(f"bci2b_subject_{subject}_compact_*_best.pth"))
+        if compact:
+            return compact[0]
+    for d in search_dirs:
+        legacy = sorted(d.glob(f"bci2b_subject_{subject}_eegnetv4_*_best.pth"))
+        if legacy:
+            return legacy[0]
+    raise FileNotFoundError(
+        f"BCI IV-2b teacher checkpoint not found for seed={seed}, subject={subject}."
         )
     return candidates[0]
 

@@ -28,12 +28,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def find_teacher(subject: int, seed: int) -> Path:
-    root = Path("results/bci2b_paper_multiseed") / f"seed_{seed}" / "eegnetv4_4s_teacher"
-    matches = list(root.glob(f"bci2b_subject_{subject}_eegnetv4_window_4_*_best.pth"))
+    root = Path("results/unified_teachers/bci2b") / f"seed_{seed}"
+    matches = list(root.glob(f"bci2b_subject_{subject}_compact_*_best.pth"))
+    if not matches:
+        # Legacy fallback
+        root = Path("results/bci2b_paper_multiseed") / f"seed_{seed}" / "eegnetv4_4s_teacher"
+        matches = list(root.glob(f"bci2b_subject_{subject}_eegnetv4_window_4_*_best.pth"))
     if seed == 42 and not matches:
         root = Path("results/bci2b_eegnetv4_4s_teachers_seed42")
         matches = list(root.glob(f"bci2b_subject_{subject}_eegnetv4_window_4_*_best.pth"))
-    if len(matches) != 1:
+    if len(matches) < 1:
         raise FileNotFoundError(f"Expected one teacher for seed={seed}, found {len(matches)}.")
     return matches[0]
 
