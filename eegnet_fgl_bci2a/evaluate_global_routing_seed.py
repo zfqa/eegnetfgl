@@ -33,6 +33,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subjects", type=int, nargs="+", default=list(range(1, 10)))
     parser.add_argument("--candidate_root", type=str, required=True)
     parser.add_argument("--adaptive_dual_root", type=str, required=True)
+    parser.add_argument("--paper2a_root", type=str, default="results/paper_moabb_multiseed_unified")
+    parser.add_argument("--paper2b_root", type=str, default="results/bci2b_paper_multiseed_unified")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--val_ratio", type=float, default=0.2)
@@ -90,26 +92,30 @@ def select_global(metrics: dict[str, dict[str, float]]) -> str:
     return min(metrics, key=lambda name: (-metrics[name]["val_acc"], priority[name]))
 
 
-def bci2a_fixed_paths(subject: int, seed: int) -> tuple[Path, Path]:
+def bci2a_fixed_paths(root: Path, subject: int, seed: int) -> tuple[Path, Path]:
     fixed_ce = (
-        Path("results/paper_moabb_multiseed/ce_compact")
+        root
+        / "ce_compact"
         / f"seed_{seed}"
         / f"subject_{subject}_window_2_EEGNet-CE_taskimputation_ratio0_lam0.8_ce_best.pth"
     )
-    dual_root = Path("results/paper_moabb_multiseed/dual_ablation") / f"seed_{seed}"
+    dual_root = root / "dual_ablation" / f"seed_{seed}"
     matches = list(
         dual_root.glob(
             f"s{subject}_sw2_tw4_seed{seed}_Riemann-guided dual KD_"
-            "diff0_a0.4_0.4_t1_raw_dual_kd_*_compact_best.pth"
+            "diff0_a0.4_0.4_t1_cal_temperature_rsel_inner_cv5_"
+            "raw_dual_kd_*_compact_best.pth"
         )
     )
     if len(matches) != 1:
-        raise FileNotFoundError(f"Expected one BCI2a fixed dual checkpoint, found {len(matches)}.")
+        raise FileNotFoundError(
+            f"Expected one unified BCI2a fixed dual checkpoint, found {len(matches)} in {dual_root}."
+        )
     return fixed_ce, matches[0]
 
 
-def bci2b_fixed_paths(subject: int, seed: int) -> tuple[Path, Path]:
-    csv_path = Path("results/bci2b_paper_multiseed") / f"seed_{seed}" / "deep_models" / "riemann_guided_results.csv"
+def bci2b_fixed_paths(root: Path, subject: int, seed: int) -> tuple[Path, Path]:
+    csv_path = root / f"seed_{seed}" / "deep_models" / "riemann_guided_results.csv"
     rows = pd.read_csv(csv_path)
     common = (
         (rows["subject"].astype(int) == subject)
@@ -118,6 +124,10 @@ def bci2b_fixed_paths(subject: int, seed: int) -> tuple[Path, Path]:
         & np.isclose(rows["spatial_structure_weight"].astype(float), 0.0)
         & np.isclose(rows["geometry_weight"].astype(float), 0.0)
         & np.isclose(rows["supcon_weight"].astype(float), 0.0)
+        & (rows["teacher_calibration"].astype(str) == "temperature")
+        & (rows["confidence_mode"].astype(str) == "none")
+        & (rows["riemann_selection"].astype(str) == "inner_cv")
+        & (rows["riemann_selection_folds"].astype(int) == 5)
     )
     fixed_ce_rows = rows[
         common
@@ -129,38 +139,18 @@ def bci2b_fixed_paths(subject: int, seed: int) -> tuple[Path, Path]:
         & np.isclose(rows["eegnet_kd_weight"].astype(float), 0.4)
         & np.isclose(rows["kl_weight"].astype(float), 0.4)
     ]
-    if len(fixed_ce_rows) == 1:
-        fixed_ce = Path(fixed_ce_rows.iloc[0]["checkpoint"])
-    elif seed == 42:
-        fixed_ce = (
-            Path("results/bci2b_eegnetv4_confidence_window_1s_subject1")
-            / f"subject_{subject}"
-            / "final_fixed_0_2s_best.pth"
-        )
-    else:
+    if len(fixed_ce_rows) != 1:
         raise ValueError(
-            f"Expected one BCI2b CE row for subject={subject}, seed={seed}; "
+            f"Expected one unified BCI2b CE row for subject={subject}, seed={seed}; "
             f"found {len(fixed_ce_rows)}."
         )
-    if len(fixed_dual_rows) == 1:
-        fixed_dual = Path(fixed_dual_rows.iloc[0]["checkpoint"])
-    elif seed == 42:
-        matches = list(
-            Path("results/bci2b_compact_2s_dual_teacher_seed42").glob(
-                f"bci2b_subject_{subject}_compact_window_2_riemwin_4_seed_42_"
-                "eegkd_0.4_riekd_0.4_*_best.pth"
-            )
-        )
-        if len(matches) != 1:
-            raise FileNotFoundError(
-                f"Expected one seed-42 BCI2b fixed dual checkpoint, found {len(matches)}."
-            )
-        fixed_dual = matches[0]
-    else:
+    if len(fixed_dual_rows) != 1:
         raise ValueError(
-            f"Expected one BCI2b dual row for subject={subject}, seed={seed}; "
+            f"Expected one unified BCI2b dual row for subject={subject}, seed={seed}; "
             f"found {len(fixed_dual_rows)}."
         )
+    fixed_ce = Path(fixed_ce_rows.iloc[0]["checkpoint"])
+    fixed_dual = Path(fixed_dual_rows.iloc[0]["checkpoint"])
     return fixed_ce, fixed_dual
 
 
@@ -230,6 +220,8 @@ def main() -> None:
     device = resolve_device(args.device)
     candidate_root = Path(args.candidate_root)
     adaptive_dual_root = Path(args.adaptive_dual_root)
+    paper2a_root = Path(args.paper2a_root)
+    paper2b_root = Path(args.paper2b_root)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
@@ -237,13 +229,13 @@ def main() -> None:
     for subject in args.subjects:
         if args.dataset == "bci2a":
             X, y, metadata = load_bci2a_subject_moabb_standard(subject)
-            fixed_ce, fixed_dual = bci2a_fixed_paths(subject, args.seed)
+            fixed_ce, fixed_dual = bci2a_fixed_paths(paper2a_root, subject, args.seed)
             adaptive_dual = adaptive_dual_root / f"subject_{subject}_adaptive_dual_best.pth"
         else:
             X, y, metadata = load_bci2b_subject(
                 subject, fmin=8.0, fmax=32.0, tmin=0.0, tmax=4.0
             )
-            fixed_ce, fixed_dual = bci2b_fixed_paths(subject, args.seed)
+            fixed_ce, fixed_dual = bci2b_fixed_paths(paper2b_root, subject, args.seed)
             adaptive_dual = adaptive_dual_root / f"subject_{subject}_stable_peak_dual_teacher_best.pth"
         X_train, y_train, X_val, y_val, X_test, y_test = split_session_train_val_test(
             X, y, metadata, val_ratio=args.val_ratio, seed=args.seed

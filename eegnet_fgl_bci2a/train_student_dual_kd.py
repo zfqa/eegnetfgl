@@ -7,13 +7,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from pyriemann.classification import FgMDM, MDM
-from pyriemann.estimation import Covariances
-from pyriemann.tangentspace import TangentSpace
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.svm import LinearSVC
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -38,10 +32,16 @@ from utils.riemann import (
     normalize_features,
     riemannian_distance,
     riemannian_mean,
-    spd_power,
     tangent_space_features,
 )
+from utils.riemann_teacher import fit_paper_riemann_teacher_logits as fit_shared_paper_riemann_teacher_logits
 from utils.seed import set_seed
+from utils.teacher_utils import (
+    apply_temperature_scaling,
+    collect_teacher_logits,
+    fit_temperature_scaling,
+    load_frozen_eegnet_teacher as load_validated_eegnet_teacher,
+)
 from utils.train_utils import EarlyStopping, append_or_update_csv, evaluate, metric_row, resolve_device, strip_arrays
 
 
@@ -112,6 +112,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
+        "--teacher_calibration",
+        type=str,
+        default="temperature",
+        choices=["none", "temperature"],
+        help="Calibrate teacher soft labels on the training-session validation split.",
+    )
+    parser.add_argument(
+        "--require_teacher_preprocess_metadata",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reject legacy EEGNet checkpoints without preprocessing metadata.",
+    )
+    parser.add_argument(
         "--loss_type",
         type=str,
         default="diffusion_aware_dual_kd",
@@ -126,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save_dir", type=str, default="results/dual_kd")
     parser.add_argument("--method_name", type=str, default="")
-    parser.add_argument("--protocol", type=str, default="project", choices=["project", "moabb_standard"])
+    parser.add_argument("--protocol", type=str, default="moabb_standard", choices=["project", "moabb_standard"])
     parser.add_argument("--fmin", type=float, default=4)
     parser.add_argument("--fmax", type=float, default=38)
     parser.add_argument("--tmin", type=float, default=0)
@@ -148,7 +161,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pool2", type=int, default=8)
 
     parser.add_argument("--eegnet_teacher_path", type=str, default="")
-    parser.add_argument("--riemann_teacher_style", type=str, default="simple", choices=["simple", "paper"])
+    parser.add_argument("--riemann_teacher_style", type=str, default="paper", choices=["simple", "paper"])
     parser.add_argument("--riemann_cov_shrinkage", type=float, default=0.001)
     parser.add_argument("--riemann_c_grid", type=str, default="0.01,0.03,0.1,0.3,1,3,10")
     parser.add_argument(
@@ -160,6 +173,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--riemann_cov_estimator", type=str, default="oas")
     parser.add_argument("--riemann_alignment", type=str, default="none", choices=["none", "euclid", "riemann"])
     parser.add_argument("--riemann_metric", type=str, default="riemann")
+    parser.add_argument(
+        "--riemann_selection",
+        type=str,
+        default="inner_cv",
+        choices=["validation", "inner_cv"],
+    )
+    parser.add_argument("--riemann_selection_folds", type=int, default=5)
 
     parser.add_argument("--diffusion_multiplier", type=float, default=None, help="Legacy alias for --diffusion_ratio.")
     parser.add_argument("--diffusion_ratio", type=float, default=None)
@@ -291,27 +311,18 @@ def student_model_args(args: argparse.Namespace, n_channels: int, n_samples: int
     }
 
 
-def load_frozen_eegnet_teacher(teacher_path: Path, n_expected_samples: int, device: torch.device) -> tuple[nn.Module, dict]:
-    if not teacher_path.exists():
-        raise FileNotFoundError(f"EEGNet teacher checkpoint not found: {teacher_path}")
-    checkpoint = torch.load(teacher_path, map_location=device)
-    model_args = checkpoint.get("model_args")
-    if model_args is None:
-        raise KeyError(f"Checkpoint does not contain model_args: {teacher_path}")
-    checkpoint_samples = int(model_args["n_samples"])
-    if checkpoint_samples != n_expected_samples:
-        raise ValueError(
-            f"EEGNet teacher expects {checkpoint_samples} samples, but teacher input has {n_expected_samples}. "
-            "Use the matching 4s teacher checkpoint and teacher_window."
-        )
-    variant = str(checkpoint.get("model_variant", "compact"))
-    model = EEGNetV4(**model_args) if variant == "eegnetv4" else EEGNet(**model_args)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device)
-    model.eval()
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
-    return model, checkpoint
+def load_frozen_eegnet_teacher(
+    teacher_path: Path,
+    n_expected_samples: int,
+    device: torch.device,
+    **expectations: Any,
+) -> tuple[nn.Module, dict]:
+    return load_validated_eegnet_teacher(
+        teacher_path,
+        device,
+        expected_samples=n_expected_samples,
+        **expectations,
+    )
 
 
 @torch.no_grad()
@@ -321,14 +332,7 @@ def collect_eegnet_teacher_logits(
     batch_size: int,
     device: torch.device,
 ) -> np.ndarray:
-    dummy_y = np.zeros(len(X_teacher), dtype=np.int64)
-    loader = DataLoader(EEGDataset(X_teacher, dummy_y), batch_size=batch_size, shuffle=False)
-    logits = []
-    teacher.eval()
-    for x, _ in loader:
-        x = x.to(device)
-        logits.append(teacher(x).detach().cpu().numpy())
-    return np.concatenate(logits, axis=0).astype(np.float32)
+    return collect_teacher_logits(teacher, X_teacher, batch_size, device)
 
 
 def filter_synthetic_by_eegnet_confidence(
@@ -339,10 +343,16 @@ def filter_synthetic_by_eegnet_confidence(
     batch_size: int,
     threshold: float,
     device: torch.device,
+    teacher_expectations: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
     if len(y_synth) == 0:
         return X_synth, y_synth, {"synthetic_after_eegnet_filter": 0.0}
-    teacher, _ = load_frozen_eegnet_teacher(teacher_path, n_expected_samples, device)
+    teacher, _ = load_frozen_eegnet_teacher(
+        teacher_path,
+        n_expected_samples,
+        device,
+        **(teacher_expectations or {}),
+    )
     logits = collect_eegnet_teacher_logits(teacher, X_synth, batch_size, device)
     probs = torch.softmax(torch.from_numpy(logits), dim=1).numpy()
     pred = probs.argmax(axis=1).astype(np.int64)
@@ -498,71 +508,6 @@ def fit_simple_riemann_teacher_logits(
     return train_logits, val_logits, diagnostics
 
 
-def normalize_trials_by_trace(X: np.ndarray) -> np.ndarray:
-    covs = covariance_matrices(X, shrinkage=0.0)
-    traces = np.trace(covs, axis1=1, axis2=2).astype(np.float32)
-    scale = np.sqrt(np.maximum(traces / X.shape[1], 1e-8)).reshape(-1, 1, 1)
-    return (X / scale).astype(np.float32)
-
-
-def apply_euclidean_alignment_many(shrinkage: float, X_train: np.ndarray, *arrays: np.ndarray) -> tuple[np.ndarray, ...]:
-    train_covs = covariance_matrices(X_train, shrinkage=shrinkage)
-    reference = train_covs.mean(axis=0)
-    reference_invsqrt = spd_power(reference, -0.5)
-
-    def transform(X: np.ndarray) -> np.ndarray:
-        return np.asarray([reference_invsqrt @ trial for trial in X], dtype=np.float32)
-
-    return (transform(X_train), *(transform(X) for X in arrays))
-
-
-def pyriemann_covariances(X: np.ndarray, estimator: str) -> np.ndarray:
-    covs = Covariances(estimator=estimator).transform(X)
-    return np.asarray(covs, dtype=np.float64)
-
-
-def apply_covariance_alignment_many(alignment: str, train_covs: np.ndarray, *arrays: np.ndarray) -> tuple[np.ndarray, ...]:
-    if alignment in {"none", "euclid"}:
-        return (train_covs, *arrays)
-    if alignment != "riemann":
-        raise ValueError(f"Unsupported Riemann alignment: {alignment}")
-    reference = riemannian_mean(train_covs)
-    return (align_covariances(train_covs, reference), *(align_covariances(covs, reference) for covs in arrays))
-
-
-def make_paper_riemann_classifier(method: str, metric: str, c_value: float | None = None) -> Any:
-    if method == "mdm":
-        return MDM(metric=metric)
-    if method == "fgmdm":
-        return FgMDM(metric=metric)
-    if method == "ts_logreg":
-        if c_value is None:
-            raise ValueError("TS-LogReg requires c_value.")
-        return Pipeline(
-            [
-                ("ts", TangentSpace(metric=metric)),
-                ("clf", LogisticRegression(C=c_value, max_iter=5000, solver="lbfgs")),
-            ]
-        )
-    if method == "ts_svm":
-        if c_value is None:
-            raise ValueError("TS-SVM requires c_value.")
-        return Pipeline(
-            [
-                ("ts", TangentSpace(metric=metric)),
-                ("clf", LinearSVC(C=c_value, dual="auto", max_iter=20000)),
-            ]
-        )
-    if method == "ts_lda":
-        return Pipeline(
-            [
-                ("ts", TangentSpace(metric=metric)),
-                ("clf", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
-            ]
-        )
-    raise ValueError(f"Unsupported paper Riemann method: {method}")
-
-
 def fit_paper_riemann_teacher_logits(
     X_train_real: np.ndarray,
     y_train_real: np.ndarray,
@@ -576,62 +521,28 @@ def fit_paper_riemann_teacher_logits(
     method: str,
     c_grid: list[float],
     euclid_shrinkage: float,
+    calibration: str = "temperature",
+    selection: str = "inner_cv",
+    selection_folds: int = 5,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    if alignment == "euclid":
-        X_train_real, X_val_real, X_train_apply, X_val_apply = apply_euclidean_alignment_many(
-            euclid_shrinkage,
-            X_train_real,
-            X_val_real,
-            X_train_apply,
-            X_val_apply,
-        )
-
-    train_covs = pyriemann_covariances(X_train_real, estimator)
-    val_covs = pyriemann_covariances(X_val_real, estimator)
-    train_apply_covs = pyriemann_covariances(X_train_apply, estimator)
-    val_apply_covs = pyriemann_covariances(X_val_apply, estimator)
-    train_covs, val_covs, train_apply_covs, val_apply_covs = apply_covariance_alignment_many(
-        alignment,
-        train_covs,
-        val_covs,
-        train_apply_covs,
-        val_apply_covs,
+    return fit_shared_paper_riemann_teacher_logits(
+        X_train_real,
+        y_train_real,
+        X_val_real,
+        y_val_real,
+        X_train_apply,
+        X_val_apply,
+        estimator=estimator,
+        alignment=alignment,
+        metric=metric,
+        method=method,
+        c_grid=c_grid,
+        euclid_shrinkage=euclid_shrinkage,
+        calibration=calibration,
+        selection=selection,
+        selection_folds=selection_folds,
+        n_classes=4,
     )
-
-    candidates = []
-    candidate_cs = c_grid if method in {"ts_logreg", "ts_svm"} else [None]
-    for c_value in candidate_cs:
-        model = make_paper_riemann_classifier(method, metric, c_value)
-        model.fit(train_covs, y_train_real)
-        val_pred = model.predict(val_covs)
-        val_metrics = evaluate_metrics(y_val_real, val_pred)
-        candidates.append({"model": model, "best_c": c_value, "val_metrics": val_metrics})
-
-    best = max(
-        candidates,
-        key=lambda item: (
-            item["val_metrics"]["accuracy"],
-            item["val_metrics"]["macro_f1"],
-            item["val_metrics"]["kappa"],
-        ),
-    )
-    train_probs = _expand_predict_proba(best["model"], train_apply_covs)
-    val_probs = _expand_predict_proba(best["model"], val_apply_covs)
-    train_logits = np.log(np.clip(train_probs, 1e-8, 1.0)).astype(np.float32)
-    val_logits = np.log(np.clip(val_probs, 1e-8, 1.0)).astype(np.float32)
-    best_c = best["best_c"]
-    diagnostics: dict[str, Any] = {
-        "riemann_best_c": float(best_c) if best_c is not None else float("nan"),
-        "riemann_val_accuracy": float(best["val_metrics"]["accuracy"]),
-        "riemann_val_macro_f1": float(best["val_metrics"]["macro_f1"]),
-        "riemann_val_kappa": float(best["val_metrics"]["kappa"]),
-        "riemann_teacher_style": "paper",
-        "riemann_paper_method": method,
-        "riemann_cov_estimator": estimator,
-        "riemann_alignment": alignment,
-        "riemann_metric": metric,
-    }
-    return train_logits, val_logits, diagnostics
 
 
 def kd_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -870,6 +781,7 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
         "alpha1",
         "alpha2",
         "temperature",
+        "teacher_calibration",
         "loss_type",
         "synthetic_ce_weight",
     }
@@ -881,6 +793,8 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
                 "riemann_cov_estimator",
                 "riemann_alignment",
                 "riemann_metric",
+                "riemann_selection",
+                "riemann_selection_folds",
             }
         )
     if args.diffusion_multiplier > 0:
@@ -917,6 +831,7 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
         & np.isclose(df["alpha1"].astype(float), float(args.alpha1))
         & np.isclose(df["alpha2"].astype(float), float(args.alpha2))
         & np.isclose(df["temperature"].astype(float), float(args.temperature))
+        & (df["teacher_calibration"].astype(str) == args.teacher_calibration)
         & (df["loss_type"].astype(str) == args.loss_type)
         & np.isclose(df["synthetic_ce_weight"].astype(float), float(args.synthetic_ce_weight))
     )
@@ -928,6 +843,8 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
             & (df["riemann_cov_estimator"].astype(str) == args.riemann_cov_estimator)
             & (df["riemann_alignment"].astype(str) == args.riemann_alignment)
             & (df["riemann_metric"].astype(str) == args.riemann_metric)
+            & (df["riemann_selection"].astype(str) == args.riemann_selection)
+            & (df["riemann_selection_folds"].astype(int) == int(args.riemann_selection_folds))
         )
     if args.diffusion_multiplier > 0:
         mask = (
@@ -990,6 +907,8 @@ def main() -> None:
         f"s{args.subject}_sw{args.student_window:g}_tw{args.teacher_window:g}_seed{args.seed}_"
         f"{resolved_method_name(args)}_diff{args.diffusion_multiplier:g}_"
         f"a{args.alpha1:g}_{args.alpha2:g}_t{args.temperature:g}_"
+        f"cal_{args.teacher_calibration}_"
+        f"rsel_{args.riemann_selection}{args.riemann_selection_folds}_"
         f"{args.loss_type}_synce{args.synthetic_ce_weight:g}_"
         f"{args.diffusion_task}_mask{args.mask_ratio:g}_lam{args.diffusion_fusion_lambda:g}_"
         f"{args.student_model_variant}"
@@ -1006,6 +925,8 @@ def main() -> None:
     X_train_raw, y_train, X_val_raw, y_val, X_test_raw, y_test = split_session_train_val_test(
         X, y, metadata, val_ratio=args.val_ratio, seed=args.seed
     )
+    train_channel_mean = X_train_raw.mean(axis=(0, 2), keepdims=True).astype(np.float32)
+    train_channel_std = (X_train_raw.std(axis=(0, 2), keepdims=True) + 1e-6).astype(np.float32)
     X_train_full, X_val_full, X_test_full = standardize_by_train(X_train_raw, X_val_raw, X_test_raw)
     X_train_teacher = crop_time_window(X_train_full, seconds=args.teacher_window, fs=args.fs)
     X_val_teacher = crop_time_window(X_val_full, seconds=args.teacher_window, fs=args.fs)
@@ -1024,7 +945,7 @@ def main() -> None:
     X_train_teacher_aug = X_train_teacher
     y_train_aug = y_train
     is_synthetic_train_aug = np.zeros(len(y_train), dtype=np.float32)
-    # Riemann apply set: raw when no diffusion; standardized+aug when diffusion active
+    # Riemann teacher always receives raw-domain signals.
     X_train_teacher_riemann_apply = X_train_teacher_raw
     X_val_teacher_riemann = X_val_teacher_raw
     if args.diffusion_multiplier > 0:
@@ -1086,6 +1007,13 @@ def main() -> None:
                 args.batch_size,
                 args.synthetic_eegnet_conf_threshold,
                 device,
+                teacher_expectations={
+                    "expected_channels": X_train_teacher.shape[1],
+                    "expected_classes": 4,
+                    "expected_subject": args.subject,
+                    "expected_seed": args.seed,
+                    "expected_dataset": "bci2a",
+                },
             )
             X_synth_teacher, y_synth, riemann_filter_diagnostics = filter_synthetic_by_riemann_covariance(
                 X_train_teacher,
@@ -1121,7 +1049,11 @@ def main() -> None:
             diffusion_diagnostics.setdefault("synthetic_pre_filter", float(len(y_synth)))
         if len(y_synth):
             X_train_teacher_aug = np.concatenate([X_train_teacher, X_synth_teacher], axis=0).astype(np.float32)
-            X_train_teacher_riemann_apply = X_train_teacher_aug
+            X_synth_teacher_raw = X_synth_teacher * train_channel_std + train_channel_mean
+            X_train_teacher_riemann_apply = np.concatenate(
+                [X_train_teacher_raw, X_synth_teacher_raw],
+                axis=0,
+            ).astype(np.float32)
             y_train_aug = np.concatenate([y_train, y_synth], axis=0).astype(np.int64)
             is_synthetic_train_aug = np.concatenate(
                 [
@@ -1158,15 +1090,56 @@ def main() -> None:
     eegnet_train_logits = None
     eegnet_val_logits = None
     eegnet_teacher_source = ""
+    eegnet_calibration_temperature = 1.0
+    eegnet_calibration_diagnostics = {"nll_before": float("nan"), "nll_after": float("nan")}
     if uses_eegnet_teacher(args.teacher_mode):
         teacher_path = Path(args.eegnet_teacher_path) if args.eegnet_teacher_path else default_eegnet_teacher_path(args.subject)
-        teacher, teacher_checkpoint = load_frozen_eegnet_teacher(teacher_path, X_train_teacher.shape[2], device)
+        teacher, teacher_checkpoint = load_frozen_eegnet_teacher(
+            teacher_path,
+            X_train_teacher.shape[2],
+            device,
+            expected_channels=X_train_teacher.shape[1],
+            expected_classes=4,
+            expected_subject=args.subject,
+            expected_seed=args.seed,
+            expected_dataset="bci2a",
+            expected_preprocess={
+                "fmin": float(args.fmin),
+                "fmax": float(args.fmax),
+                "tmin": float(args.tmin),
+                "tmax": float(args.tmax),
+                "fs": int(args.fs),
+                "val_ratio": float(args.val_ratio),
+                "protocol": args.protocol,
+            },
+            require_preprocess_metadata=args.require_teacher_preprocess_metadata,
+        )
         eegnet_teacher_source = str(teacher_path)
         print(f"Loaded frozen EEGNet teacher: {teacher_path}", flush=True)
         eegnet_train_logits = collect_eegnet_teacher_logits(teacher, X_train_teacher_aug, args.batch_size, device)
         eegnet_val_logits = collect_eegnet_teacher_logits(teacher, X_val_teacher, args.batch_size, device)
         if len(eegnet_train_logits) != len(y_train_aug) or len(eegnet_val_logits) != len(y_val):
             raise ValueError("EEGNet teacher logits length mismatch; trial order would be unsafe.")
+        if args.teacher_calibration == "temperature":
+            eegnet_calibration_temperature, eegnet_calibration_diagnostics = fit_temperature_scaling(
+                eegnet_val_logits,
+                y_val,
+            )
+            eegnet_train_logits = apply_temperature_scaling(
+                eegnet_train_logits,
+                eegnet_calibration_temperature,
+            )
+            eegnet_val_logits = apply_temperature_scaling(
+                eegnet_val_logits,
+                eegnet_calibration_temperature,
+            )
+        print(
+            f"EEGNet teacher calibration | mode={args.teacher_calibration} | "
+            f"T={eegnet_calibration_temperature:.4f} | "
+            f"val_nll={eegnet_calibration_diagnostics['nll_before']:.4f}"
+            f"->{eegnet_calibration_diagnostics['nll_after']:.4f}",
+            flush=True,
+        )
         del teacher
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1186,11 +1159,13 @@ def main() -> None:
         "riemann_cov_estimator": args.riemann_cov_estimator,
         "riemann_alignment": args.riemann_alignment,
         "riemann_metric": args.riemann_metric,
+        "riemann_selection": args.riemann_selection,
+        "riemann_selection_folds": args.riemann_selection_folds,
     }
     if uses_riemann_teacher(args.teacher_mode):
         print(
             f"Fitting 4s {args.riemann_teacher_style} Riemann teacher on real train only; "
-            "val selects hyperparameters; test is not used.",
+            f"selection={args.riemann_selection}; test is not used.",
             flush=True,
         )
         if args.riemann_teacher_style == "paper":
@@ -1207,6 +1182,9 @@ def main() -> None:
                 method=args.riemann_paper_method,
                 c_grid=parse_grid(args.riemann_c_grid),
                 euclid_shrinkage=args.riemann_cov_shrinkage,
+                calibration=args.teacher_calibration,
+                selection=args.riemann_selection,
+                selection_folds=args.riemann_selection_folds,
             )
         else:
             riemann_train_logits, riemann_val_logits, riemann_diagnostics = fit_simple_riemann_teacher_logits(
@@ -1309,6 +1287,10 @@ def main() -> None:
                 "val_metrics": {**strip_arrays(val_metrics), "dual_kd_loss": float(val_kd_loss)},
                 "eegnet_teacher_source": eegnet_teacher_source,
                 "eegnet_teacher_epoch": teacher_checkpoint.get("epoch", np.nan),
+                "eegnet_teacher_variant": teacher_checkpoint.get("model_variant", ""),
+                "teacher_calibration": args.teacher_calibration,
+                "eegnet_calibration_temperature": eegnet_calibration_temperature,
+                "eegnet_calibration_diagnostics": eegnet_calibration_diagnostics,
                 "riemann_diagnostics": riemann_diagnostics,
                 "diffusion_diagnostics": diffusion_diagnostics,
             },
@@ -1360,6 +1342,10 @@ def main() -> None:
         eegnet_teacher_val_macro_f1=eegnet_val_metrics["macro_f1"],
         eegnet_teacher_val_kappa=eegnet_val_metrics["kappa"],
         temperature=args.temperature,
+        teacher_calibration=args.teacher_calibration,
+        eegnet_calibration_temperature=eegnet_calibration_temperature,
+        eegnet_val_nll_before=eegnet_calibration_diagnostics["nll_before"],
+        eegnet_val_nll_after=eegnet_calibration_diagnostics["nll_after"],
         loss_type=args.loss_type,
         synthetic_ce_weight=args.synthetic_ce_weight,
         num_real=num_real,
@@ -1410,6 +1396,7 @@ def main() -> None:
         val_macro_f1=float(checkpoint["val_metrics"]["macro_f1"]),
         val_kappa=float(checkpoint["val_metrics"]["kappa"]),
         eegnet_teacher_source=eegnet_teacher_source,
+        eegnet_teacher_variant=teacher_checkpoint.get("model_variant", ""),
         riemann_cov_shrinkage=args.riemann_cov_shrinkage,
         riemann_c_grid=args.riemann_c_grid,
         **riemann_diagnostics,
@@ -1430,6 +1417,7 @@ def main() -> None:
             "alpha1",
             "alpha2",
             "temperature",
+            "teacher_calibration",
             "loss_type",
             "synthetic_ce_weight",
             "diffusion_ratio",
@@ -1452,6 +1440,8 @@ def main() -> None:
             "riemann_cov_estimator",
             "riemann_alignment",
             "riemann_metric",
+            "riemann_selection",
+            "riemann_selection_folds",
         ],
     )
 

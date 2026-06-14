@@ -3,6 +3,9 @@ param(
     [int[]]$Subjects = @(1, 2, 3, 4, 5, 6, 7, 8, 9),
     [int]$Epochs = 300,
     [int]$Patience = 100,
+    [string]$Root = "results\bci2b_paper_multiseed_unified",
+    [string]$TeacherRoot = "results\unified_teachers\bci2b",
+    [switch]$IncludeSpatialAblations,
     [switch]$SkipClassicalBaselines
 )
 
@@ -16,7 +19,7 @@ $python = "D:\anaconda\envs\eeg_fgl\python.exe"
 $guidedScript = "train_student_riemann_guided.py"
 $riemannScript = "train_riemann_paper.py"
 $cspScript = "train_csp_baseline.py"
-$root = "results\bci2b_paper_multiseed"
+$root = $Root
 
 function Test-FloatEqual {
     param($Actual, [double]$Expected)
@@ -54,7 +57,12 @@ function Test-GuidedResult {
                 (Test-FloatEqual $row.eegnet_kd_weight $EegnetKd) -and
                 (Test-FloatEqual $row.kl_weight $RiemannKd) -and
                 (Test-FloatEqual $row.spatial_structure_weight $Spatial) -and
-                (Test-FloatEqual $row.geometry_weight 0.0)
+                (Test-FloatEqual $row.geometry_weight 0.0) -and
+                "$($row.teacher_calibration)" -eq "temperature" -and
+                "$($row.confidence_mode)" -eq "none" -and
+                "$($row.riemann_cov_estimator)" -eq "oas" -and
+                "$($row.riemann_selection)" -eq "inner_cv" -and
+                [int]$row.riemann_selection_folds -eq 5
             ) {
                 return $true
             }
@@ -120,7 +128,14 @@ function Invoke-GuidedRun {
         "--spatial_structure_source", "filter",
         "--spatial_structure_mode", "corr",
         "--spatial_structure_trust_mode", "sample",
-        "--confidence_mode", "normalized",
+        "--confidence_mode", "none",
+        "--teacher_calibration", "temperature",
+        "--riemann_cov_estimator", "oas",
+        "--riemann_alignment", "none",
+        "--riemann_metric", "riemann",
+        "--riemann_method", "ts_logreg",
+        "--riemann_selection", "inner_cv",
+        "--riemann_selection_folds", "5",
         "--trust_gate_mode", "confidence",
         "--seed", "$Seed",
         "--epochs", "$Epochs",
@@ -146,38 +161,19 @@ function Invoke-GuidedRun {
 
 foreach ($seed in $Seeds) {
     $seedRoot = Join-Path $root "seed_$seed"
-    $teacherDir = Join-Path $seedRoot "eegnetv4_4s_teacher"
+    $teacherDir = Join-Path $seedRoot "eegnetv4_4s_upper_bound"
     $studentDir = Join-Path $seedRoot "deep_models"
     New-Item -ItemType Directory -Force -Path $teacherDir, $studentDir | Out-Null
 
     $searchDirs = @($studentDir, $teacherDir)
-    if ($seed -eq 42) {
-        $searchDirs += @(
-            "results\bci2b_eegnetv4_4s_teachers_seed42",
-            "results\bci2b_compact_2s_dual_teacher_seed42",
-            "results\bci2b_compact_2s_single_teacher_ablation_seed42",
-            "results\bci2b_eegnetv4_2s_matched_ce_vs_riemann_spatial_seed42",
-            "results\bci2b_compact_2s_teacher_vs_4s_seed42"
-        )
-    }
 
     foreach ($subject in $Subjects) {
         Invoke-GuidedRun $subject $seed $teacherDir $searchDirs `
             "EEGNetV4 4s teacher/upper bound" "eegnetv4" 4.0 0.0 0.0 0.0
 
-        $teacherCandidates = @(
-            Get-ChildItem -LiteralPath $teacherDir -Filter "bci2b_subject_${subject}_eegnetv4_window_4_riemwin_4_seed_${seed}_eegkd_0_riekd_0_geo_0_supcon_0_*_best.pth" -ErrorAction SilentlyContinue
-        )
-        if ($seed -eq 42) {
-            $teacherCandidates += @(
-                Get-ChildItem -LiteralPath "results\bci2b_eegnetv4_4s_teachers_seed42" `
-                    -Filter "bci2b_subject_${subject}_eegnetv4_window_4_riemwin_4_seed_42_eegkd_0_riekd_0_geo_0_supcon_0_*_best.pth" `
-                    -ErrorAction SilentlyContinue
-            )
-        }
-        $teacher = $teacherCandidates | Select-Object -First 1
-        if ($null -eq $teacher) {
-            throw "No EEGNetV4 teacher checkpoint found for seed=$seed subject=$subject."
+        $teacher = Join-Path (Join-Path $TeacherRoot "seed_$seed") "bci2b_subject_${subject}_eegnetv4_teacher_best.pth"
+        if (-not (Test-Path -LiteralPath $teacher)) {
+            throw "Validated EEGNetV4 teacher not found: $teacher. Run run_unified_teacher_matrix.py first."
         }
 
         Invoke-GuidedRun $subject $seed $studentDir $searchDirs `
@@ -187,15 +183,17 @@ foreach ($seed in $Seeds) {
         Invoke-GuidedRun $subject $seed $studentDir $searchDirs `
             "EEGNetV4 2s CE" "eegnetv4" 2.0 0.0 0.0 0.0
         Invoke-GuidedRun $subject $seed $studentDir $searchDirs `
-            "EEGNetV4 teacher only" "compact" 2.0 0.4 0.0 0.0 $teacher.FullName
+            "EEGNetV4 teacher only" "compact" 2.0 0.4 0.0 0.0 $teacher
         Invoke-GuidedRun $subject $seed $studentDir $searchDirs `
             "Riemann teacher only" "compact" 2.0 0.0 0.4 0.0
         Invoke-GuidedRun $subject $seed $studentDir $searchDirs `
-            "Dual teacher KD" "compact" 2.0 0.4 0.4 0.0 $teacher.FullName
-        Invoke-GuidedRun $subject $seed $studentDir $searchDirs `
-            "Riemann spatial only" "compact" 2.0 0.0 0.0 0.1
-        Invoke-GuidedRun $subject $seed $studentDir $searchDirs `
-            "Riemann KD + spatial" "compact" 2.0 0.0 0.2 0.1
+            "Dual teacher KD" "compact" 2.0 0.4 0.4 0.0 $teacher
+        if ($IncludeSpatialAblations) {
+            Invoke-GuidedRun $subject $seed $studentDir $searchDirs `
+                "Riemann spatial only" "compact" 2.0 0.0 0.0 0.1
+            Invoke-GuidedRun $subject $seed $studentDir $searchDirs `
+                "Riemann KD + spatial" "compact" 2.0 0.0 0.2 0.1
+        }
     }
 
     if (-not $SkipClassicalBaselines) {
@@ -213,6 +211,9 @@ foreach ($seed in $Seeds) {
                     "--methods", "mdm", "ts_logreg",
                     "--estimators", "oas",
                     "--alignments", "none",
+                    "--selection", "inner_cv",
+                    "--selection_folds", "5",
+                    "--calibration", "temperature",
                     "--metric", "riemann",
                     "--fmin", "8",
                     "--fmax", "32",

@@ -11,20 +11,20 @@ from torch.utils.data import DataLoader
 
 from models import EEGNetV4
 from run_bci2b_eegnetv4_confidence_window_subject1 import crop_by_starts, detect_peak_starts
-from train_riemann_baseline import build_riemann_features, parse_grid
 from train_student_riemann_guided import (
     RiemannGuidedDataset,
     build_eegnet_model,
     build_riemann_structure_targets,
     build_trust_weights,
-    collect_eegnet_teacher_probs,
-    fit_best_riemann_logreg,
+    collect_eegnet_teacher_logits,
     load_frozen_eegnet_teacher,
     train_one_epoch_riemann_guided,
 )
 from utils.data_loader import EEGDataset, load_bci2b_subject, split_session_train_val_test, standardize_by_train
 from utils.metrics import evaluate_metrics
+from utils.riemann_teacher import PaperRiemannTeacher, parse_float_grid
 from utils.seed import set_seed
+from utils.teacher_utils import apply_temperature_scaling, fit_temperature_scaling, logits_to_probabilities
 from utils.train_utils import EarlyStopping, append_or_update_csv, evaluate, resolve_device, strip_arrays
 from utils.windowing import valid_window_starts
 
@@ -63,6 +63,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha_eegnet", type=float, default=0.4)
     parser.add_argument("--alpha_riemann", type=float, default=0.4)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--teacher_calibration", type=str, default="temperature", choices=["none", "temperature"])
+    parser.add_argument("--confidence_mode", type=str, default="none", choices=["none", "raw", "normalized"])
+    parser.add_argument("--riemann_selection", type=str, default="inner_cv", choices=["validation", "inner_cv"])
+    parser.add_argument("--riemann_selection_folds", type=int, default=5)
     parser.add_argument("--spatial_structure_weight", type=float, default=0.0)
     parser.add_argument(
         "--spatial_structure_source",
@@ -126,7 +130,7 @@ def build_training_args(args: argparse.Namespace) -> SimpleNamespace:
         supcon_temperature=0.2,
         temperature=args.temperature,
         label_smoothing=0.0,
-        confidence_mode="normalized",
+        confidence_mode=args.confidence_mode,
         confidence_threshold=0.0,
         trust_gate_mode="confidence",
         trust_gate_c=1.0,
@@ -137,6 +141,14 @@ def build_training_args(args: argparse.Namespace) -> SimpleNamespace:
 def load_detector(path: Path, n_channels: int, n_samples: int, n_classes: int, device: torch.device) -> EEGNetV4:
     if not path.exists():
         raise FileNotFoundError(f"Detector checkpoint not found: {path}")
+    checkpoint = torch.load(path, map_location=device)
+    # Infer n_channels from checkpoint to handle detectors trained on different channel counts
+    # (e.g., BCI 2b uses 3 channels, but data loading may pass 22)
+    state_dict = checkpoint["model_state_dict"]
+    if "features.3.weight" in state_dict:
+        inferred_channels = state_dict["features.3.weight"].shape[2]
+        if inferred_channels != n_channels:
+            n_channels = inferred_channels
     detector = EEGNetV4(
         n_channels=n_channels,
         n_samples=n_samples,
@@ -155,7 +167,6 @@ def load_detector(path: Path, n_channels: int, n_samples: int, n_classes: int, d
         classifier_max_norm=0.25,
         dropout_type="dropout",
     ).to(device)
-    checkpoint = torch.load(path, map_location=device)
     detector.load_state_dict(checkpoint["model_state_dict"])
     detector.eval()
     for parameter in detector.parameters():
@@ -192,14 +203,14 @@ def main() -> None:
         tmin=args.tmin,
         tmax=args.tmax,
     )
-    X_train, y_train, X_val, y_val, X_test, y_test = split_session_train_val_test(
+    X_train_raw, y_train, X_val_raw, y_val, X_test_raw, y_test = split_session_train_val_test(
         X,
         y,
         metadata,
         val_ratio=args.val_ratio,
         seed=args.seed,
     )
-    X_train, X_val, X_test = standardize_by_train(X_train, X_val, X_test)
+    X_train, X_val, X_test = standardize_by_train(X_train_raw, X_val_raw, X_test_raw)
     n_classes = int(np.max(y)) + 1
 
     starts = detector_starts(args, X_train.shape[-1])
@@ -208,7 +219,7 @@ def main() -> None:
     detector = load_detector(
         Path(args.detector_path),
         n_channels=X_train.shape[1],
-        n_samples=int(round(args.detector_win * args.fs)),
+        n_samples=125,  # Detector was trained with 0.5s window at 250Hz
         n_classes=n_classes,
         device=device,
     )
@@ -234,6 +245,8 @@ def main() -> None:
     # The teachers always receive the complete 4-s signal from the same trial.
     X_teacher_train = X_train[:, :, : int(round(4.0 * args.fs))]
     X_teacher_val = X_val[:, :, : int(round(4.0 * args.fs))]
+    X_teacher_train_raw = X_train_raw[:, :, : int(round(4.0 * args.fs))]
+    X_teacher_val_raw = X_val_raw[:, :, : int(round(4.0 * args.fs))]
 
     print(
         f"BCI2b subject={args.subject} seed={args.seed} | stable-peak detector "
@@ -248,25 +261,33 @@ def main() -> None:
         flush=True,
     )
 
-    print("Fitting 4-s Riemann teacher...", flush=True)
-    riemann_data = build_riemann_features(
-        X_teacher_train,
-        X_teacher_val,
-        X_teacher_val,
-        shrinkage=0.001,
-    )
-    riemann_teacher = fit_best_riemann_logreg(
-        riemann_data["train_features"],
+    print("Fitting shared paper-grade 4-s Riemann teacher on raw EEG...", flush=True)
+    riemann_teacher = PaperRiemannTeacher(
+        estimator="oas",
+        alignment="none",
+        metric="riemann",
+        method="ts_logreg",
+        c_grid=tuple(parse_float_grid("0.01,0.03,0.1,0.3,1,3,10")),
+        calibration=args.teacher_calibration,
+        selection=args.riemann_selection,
+        selection_folds=args.riemann_selection_folds,
+        n_classes=n_classes,
+    ).fit(
+        X_teacher_train_raw,
         y_train,
-        riemann_data["val_features"],
+        X_teacher_val_raw,
         y_val,
-        parse_grid("0.01,0.1,1,10"),
     )
-    riemann_model = riemann_teacher["model"]
-    riemann_train_probs = riemann_model.predict_proba(riemann_data["train_features"]).astype(np.float32)
-    riemann_val_probs = riemann_model.predict_proba(riemann_data["val_features"]).astype(np.float32)
+    riemann_train_output = riemann_teacher.predict_output(X_teacher_train_raw)
+    riemann_val_output = riemann_teacher.predict_output(X_teacher_val_raw)
+    riemann_train_probs = riemann_train_output.probabilities
+    riemann_val_probs = riemann_val_output.probabilities
+    riemann_data = {
+        "train_features": riemann_train_output.features,
+        "val_features": riemann_val_output.features,
+    }
     riemann_structure = build_riemann_structure_targets(
-        riemann_data["train_aligned"],
+        riemann_train_output.covariances,
         args.spatial_structure_mode,
     )
 
@@ -275,19 +296,42 @@ def main() -> None:
         Path(args.eegnet_teacher_path),
         X_teacher_train.shape[-1],
         device,
+        expected_channels=X_teacher_train.shape[1],
+        expected_classes=n_classes,
+        expected_subject=args.subject,
+        expected_seed=args.seed,
+        expected_dataset="bci2b",
+        expected_selection_metric="nll",
+        expected_preprocess={
+            "fmin": float(args.fmin),
+            "fmax": float(args.fmax),
+            "tmin": float(args.tmin),
+            "tmax": float(args.tmax),
+            "fs": int(args.fs),
+            "val_ratio": float(args.val_ratio),
+            "protocol": "moabb_standard",
+            "standardization": "train_channel",
+        },
     )
-    eegnet_train_probs = collect_eegnet_teacher_probs(
+    eegnet_train_logits = collect_eegnet_teacher_logits(
         eegnet_teacher,
         X_teacher_train,
         args.batch_size,
         device,
     )
-    eegnet_val_probs = collect_eegnet_teacher_probs(
+    eegnet_val_logits = collect_eegnet_teacher_logits(
         eegnet_teacher,
         X_teacher_val,
         args.batch_size,
         device,
     )
+    eegnet_calibration_temperature = 1.0
+    if args.teacher_calibration == "temperature":
+        eegnet_calibration_temperature, _ = fit_temperature_scaling(eegnet_val_logits, y_val)
+        eegnet_train_logits = apply_temperature_scaling(eegnet_train_logits, eegnet_calibration_temperature)
+        eegnet_val_logits = apply_temperature_scaling(eegnet_val_logits, eegnet_calibration_temperature)
+    eegnet_train_probs = logits_to_probabilities(eegnet_train_logits)
+    eegnet_val_probs = logits_to_probabilities(eegnet_val_logits)
     eegnet_val_metrics = evaluate_metrics(y_val, eegnet_val_probs.argmax(axis=1))
     del eegnet_teacher
     if device.type == "cuda":
@@ -303,8 +347,9 @@ def main() -> None:
     )
     print(
         f"Teacher validation | EEGNet acc={eegnet_val_metrics['accuracy']:.4f} | "
-        f"Riemann acc={riemann_teacher['val_metrics']['accuracy']:.4f} | "
-        f"Riemann confidence mean={train_confidence.mean():.4f}",
+        f"Riemann acc={riemann_teacher.diagnostics['riemann_val_accuracy']:.4f} | "
+        f"Riemann confidence mean={train_confidence.mean():.4f} | "
+        f"calibration={args.teacher_calibration}",
         flush=True,
     )
 
@@ -398,6 +443,9 @@ def main() -> None:
         "alpha_eegnet": args.alpha_eegnet,
         "alpha_riemann": args.alpha_riemann,
         "temperature": args.temperature,
+        "teacher_calibration": args.teacher_calibration,
+        "confidence_mode": args.confidence_mode,
+        "eegnet_calibration_temperature": eegnet_calibration_temperature,
         "spatial_structure_weight": args.spatial_structure_weight,
         "spatial_structure_source": args.spatial_structure_source,
         "spatial_structure_mode": args.spatial_structure_mode,
@@ -409,7 +457,11 @@ def main() -> None:
         "val_detector_score": float(val_scores.mean()),
         "test_detector_score": float(test_scores.mean()),
         "eegnet_teacher_val_accuracy": float(eegnet_val_metrics["accuracy"]),
-        "riemann_teacher_val_accuracy": float(riemann_teacher["val_metrics"]["accuracy"]),
+        "riemann_teacher_val_accuracy": float(riemann_teacher.diagnostics["riemann_val_accuracy"]),
+        "riemann_calibration_temperature": float(riemann_teacher.calibration_temperature),
+        "riemann_input_preprocessing": "raw",
+        "riemann_selection": args.riemann_selection,
+        "riemann_selection_folds": args.riemann_selection_folds,
         "teacher_epoch": int(teacher_checkpoint["epoch"]),
         "best_epoch": int(checkpoint["epoch"]),
         "accuracy": float(test_metrics["accuracy"]),
@@ -426,6 +478,10 @@ def main() -> None:
             "seed",
             "strategy",
             "smooth_k",
+            "teacher_calibration",
+            "confidence_mode",
+            "riemann_selection",
+            "riemann_selection_folds",
             "spatial_structure_weight",
             "spatial_structure_source",
             "spatial_structure_mode",

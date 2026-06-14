@@ -157,15 +157,26 @@ METHODS = {
     ],
     "2.3 Compact student and long-window teachers": [
         (
-            "All routed candidate classifiers used Compact EEGNet with F1=8 temporal filters, "
-            "depth multiplier D=2, F2=16 pointwise filters, a 64-sample temporal kernel, ELU "
-            "activations, average pooling, and dropout of 0.5. The frozen 4-s neural teacher "
-            "was Compact EEGNet for dataset 2a and EEGNetV4 for dataset 2b; each teacher was "
-            "trained on the same subject. The Riemannian teacher estimated "
-            "4-s trial covariance matrices with Oracle Approximating Shrinkage, projected "
-            "them to the tangent space using the Riemannian metric, and fitted multinomial "
-            "logistic regression. Its regularization parameter was selected on validation "
-            "data from {0.01, 0.03, 0.1, 0.3, 1, 3, 10}."
+            "All routed candidate classifiers used a PyTorch implementation of Compact EEGNet "
+            "with input shape [batch, 1, channels, samples], F1=8 temporal filters, depth "
+            "multiplier D=2, F2=16 pointwise filters, a 64-sample temporal kernel with "
+            "same-mode padding, ELU activations, average pooling with kernel size 4 and 8, "
+            "and dropout of 0.5. No max-norm weight constraint was applied to the Compact "
+            "variant. The frozen 4-s neural teacher was Compact EEGNet for dataset 2a and an "
+            "EEGNetV4-style architecture for dataset 2b; the latter used exact same-padding "
+            "via ZeroPad2d, Keras-style BatchNorm (momentum 0.01, eps 0.001), a 125-sample "
+            "temporal kernel, separable convolution kernel of 16, depthwise max-norm "
+            "constraint of 1.0, and classifier max-norm of 0.25. Each teacher was trained on "
+            "the same subject using the training subset only."
+        ),
+        (
+            "The Riemannian teacher estimated 4-s trial covariance matrices using Oracle "
+            "Approximating Shrinkage (OAS) as implemented in pyriemann, projected them to "
+            "the tangent space at the Riemannian mean using the affine-invariant metric, and "
+            "fitted multinomial logistic regression (solver lbfgs, maximum 5000 iterations). "
+            "Its inverse regularization parameter C was selected on validation data from "
+            "{0.01, 0.03, 0.1, 0.3, 1, 3, 10}. No global Riemannian alignment was applied "
+            "across trials; each trial's covariance was used directly after shrinkage."
         ),
         (
             "The dual-teacher objective was L = CE + alpha_E KL_E + alpha_R KL_R. Here CE "
@@ -224,12 +235,20 @@ METHODS = {
             "Riemannian tangent-space logistic regression using OAS covariance estimation, "
             "and CSP followed by shrinkage LDA, each evaluated with 2-s and 4-s inputs. "
             "Every reported baseline therefore contains 45 runs (nine subjects multiplied "
-            "by five seeds). ShallowConvNet and DeepConvNet were not evaluated and are not "
-            "included in the reported comparisons. For comparisons between routing and the "
-            "six external baselines, five-seed results were first averaged within each "
-            "subject, followed by paired t-tests and Wilcoxon signed-rank tests across nine "
-            "subjects. Holm correction was applied separately within each dataset across "
-            "the six comparisons."
+            "by five seeds). EEGNetV4 used the same architecture as the dataset 2b neural "
+            "teacher (125-sample temporal kernel, max-norm constraints, Adam optimizer "
+            "without weight decay). The CSP baseline used MNE's CSP implementation with "
+            "the number of spatial filters selected by validation accuracy from {4, 6, 8, "
+            "10, 12}, paired with shrinkage LDA (solver lsqr, automatic shrinkage "
+            "estimation). Because reported accuracies in MI-EEG studies are strongly "
+            "affected by window length, preprocessing, session split, and model-selection "
+            "protocol, the primary comparisons in this study are restricted to baselines "
+            "reproduced under the same leakage-controlled five-seed protocol. ShallowConvNet "
+            "and DeepConvNet were not evaluated and are not included in the reported "
+            "comparisons. For comparisons between routing and the six external baselines, "
+            "five-seed results were first averaged within each subject, followed by paired "
+            "t-tests and Wilcoxon signed-rank tests across nine subjects. Holm correction "
+            "was applied separately within each dataset across the six comparisons."
         ),
         (
             "For practical interpretation, the effective signal endpoint was defined as "
@@ -275,7 +294,53 @@ RESULTS = {
             "supports directional generalization but not a statistically reliable benefit."
         ),
     ],
-    "3.3 Comparison with neural and classical baselines": [
+    "3.3 Ablation of neural and Riemannian teachers": [
+        (
+            "To examine the contribution of each teacher, we compared four supervision "
+            "conditions under the same 2-s Compact EEGNet architecture and five-seed "
+            "protocol: CE-only (no teacher), neural-teacher-only KD (alpha_E=0.4, "
+            "alpha_R=0.0), Riemannian-teacher-only KD (alpha_E=0.0, alpha_R=0.4), and "
+            "dual-teacher KD (alpha_E=0.4, alpha_R=0.4)."
+        ),
+        (
+            "On dataset 2a, neural-teacher-only KD reached 0.5742, numerically above the CE "
+            "baseline of 0.5672, whereas Riemannian-teacher-only KD reached 0.5655. Neither "
+            "single-teacher difference from CE was significant. Dual-teacher KD reached "
+            "0.5847, an improvement of +1.75 percentage points over CE. The combined result "
+            "is consistent with complementary neural and covariance-geometric supervision, "
+            "although the dual condition also used a larger total KD weight."
+        ),
+        (
+            "On dataset 2b, CE reached 0.7635, neural-teacher-only KD reached 0.7667, "
+            "Riemannian-teacher-only KD reached 0.7633, and dual-teacher KD reached 0.7677. "
+            "The dual-teacher gain over CE was +0.42 percentage points and was not "
+            "significant (paired t-test p=0.4574; Wilcoxon p=0.4258). The smaller effect is "
+            "consistent with the two-class, three-channel task leaving less room for "
+            "additional teacher supervision."
+        ),
+        (
+            "Dual-teacher KD was the strongest individual candidate on both datasets, but "
+            "its advantage was statistically reliable only on dataset 2a. Because each "
+            "single-teacher condition used weight 0.4 while the dual condition used a total "
+            "KD weight of 0.8, these results do not by themselves separate teacher "
+            "complementarity from distillation-strength effects. They nevertheless show "
+            "that teacher utility varies across datasets and subjects, motivating the "
+            "validation-controlled routing strategy described in Section 2.5."
+        ),
+        (
+            "Paired statistical tests across nine dataset 2a subjects confirmed that "
+            "dual-teacher KD significantly outperformed CE (paired t-test p=0.0122; "
+            "Wilcoxon p=0.0156; Cohen's dz=1.07; seven wins, one tie, one loss) and "
+            "significantly outperformed neural-teacher-only KD (p=0.0163; Wilcoxon "
+            "p=0.0391; dz=1.01). The comparison with Riemannian-teacher-only KD was "
+            "marginally non-significant (p=0.0510; Wilcoxon p=0.0547; dz=0.76). Neither "
+            "single-teacher variant significantly differed from CE (neural-only vs CE: "
+            "p=0.3603; Riemannian-only vs CE: p=0.8057), confirming that individual "
+            "teachers did not reliably improve or degrade performance. On dataset 2b, none "
+            "of the corresponding teacher comparisons reached significance."
+        ),
+    ],
+    "3.4 Comparison with neural and classical baselines": [
         (
             "On dataset 2a, global routing was numerically higher than Compact EEGNet 4-s CE "
             "(59.31% versus 58.36%; +0.96 percentage points; six wins and three losses), but "
@@ -326,7 +391,7 @@ RESULTS = {
             "should not be interpreted as measured online decision latency."
         ),
     ],
-    "3.4 Route usage and subject heterogeneity": [
+    "3.5 Route usage and subject heterogeneity": [
         (
             "Across 45 runs per dataset, fixed routes were selected in 64.4% of dataset 2a "
             "runs and 62.2% of dataset 2b runs. Dual-teacher routes were selected in 48.9% "
@@ -354,6 +419,15 @@ DISCUSSION = [
         "subjects. The router combined these complementary behaviors and avoided applying "
         "temporal adaptation or teacher supervision when validation evidence did not support "
         "them."
+    ),
+    (
+        "The ablation of teacher supervision (Section 3.3) clarifies the mechanism behind "
+        "the dual-teacher result. The combined teachers significantly improved over CE on "
+        "dataset 2a, whereas neither single teacher produced a significant change. This "
+        "pattern is consistent with complementary neural and covariance-geometric "
+        "supervision, but it is not conclusive because the dual condition has a larger total "
+        "KD weight. A complete weight-matched ablation across all seeds is therefore needed "
+        "to separate teacher complementarity from distillation-strength effects."
     ),
     (
         "The result also clarifies the role of long-window teachers. Distillation was useful "
@@ -393,9 +467,7 @@ DISCUSSION = [
         "The strongest next methodological step is out-of-fold route estimation within the "
         "training session. Candidate utility could be estimated across several internal "
         "folds, with a conservative safety threshold that activates adaptive or teacher-guided "
-        "routes only when their advantage is stable. Validation-controlled spatial guidance "
-        "is another candidate extension, but the current spatial-gating pilot was developed "
-        "on one dataset 2b subject and is therefore not included as a main paper result."
+        "routes only when their advantage is stable."
     ),
 ]
 
@@ -442,7 +514,38 @@ CONCLUSION = (
     "designs for stronger generalization."
 )
 
-REFERENCES = base.REFERENCES
+REFERENCES = [
+    "Altaheri H, Muhammad G, Alsulaiman M et al (2023) Deep learning techniques for classification of electroencephalogram (EEG) motor imagery (MI) signals: a review. Neural Comput Appl 35:14681-14722. https://doi.org/10.1007/s00521-023-08542-7",
+    "Ang KK, Guan C (2018) EEG-based strategies for stroke rehabilitation. In: Nam CS, Nijholt A, Lotte F (eds) Brain-computer interfaces handbook. CRC Press, pp 553-574",
+    "Barachant A, Bonnet S, Congedo M, Jutten C (2012) Multiclass brain-computer interface classification by Riemannian geometry. IEEE Trans Biomed Eng 59:920-928. https://doi.org/10.1109/TBME.2011.2172210",
+    "Barachant A, Bonnet S, Congedo M, Jutten C (2013) Classification of covariance matrices using a Riemannian-based kernel for BCI applications. Neurocomputing 112:172-178. https://doi.org/10.1016/j.neucom.2012.12.039",
+    "Blankertz B, Tomioka R, Lemm S, Kawanabe M, Muller KR (2008) Optimizing spatial filters for robust EEG single-trial analysis. IEEE Signal Process Mag 25:41-56. https://doi.org/10.1109/MSP.2008.4408441",
+    "Brunner C, Leeb R, Muller-Putz G, Schlogl A, Pfurtscheller G (2010) BCI Competition 2008: Graz data set A. Institute for Knowledge Discovery, Graz University of Technology",
+    "Chen Y, Wiesel A, Eldar YC, Hero AO (2010) Shrinkage algorithms for MMSE covariance estimation. IEEE Trans Signal Process 58:5016-5029. https://doi.org/10.1109/TSP.2010.2053029",
+    "Congedo M, Barachant A, Bhatia R (2017) Riemannian geometry for EEG-based brain-computer interfaces; a primer and a review. BCI 4:1-39. https://doi.org/10.1080/2326263X.2017.1297192",
+    "Cui J, Lan Z, Liu Y et al (2022) A compact and interpretable convolutional neural network for cross-subject driver drowsiness recognition from single-channel EEG. IEEE Trans Neural Syst Rehabil Eng 30:286-296. https://doi.org/10.1109/TNSRE.2022.3147419",
+    "Ding Y, Robinson N, Zeng Q et al (2022) TSception: a deep learning framework for emotion detection using EEG. In: Proc Int Joint Conf Neural Networks (IJCNN), pp 1-8. https://doi.org/10.1109/IJCNN55064.2022.9967692",
+    "Hinton G, Vinyals O, Dean J (2015) Distilling the knowledge in a neural network. arXiv:1503.02531. https://doi.org/10.48550/arXiv.1503.02531",
+    "Jayaram V, Barachant A (2018) MOABB: trustworthy algorithm benchmarking for BCIs. J Neural Eng 15:066011. https://doi.org/10.1088/1741-2552/aadea0",
+    "Kalunga EK, Chevallier S, Barre Q, Djouani K, Monacelli E, Hamam Y (2016) Online SSVEP-based BCI using Riemannian geometry. Neurocomputing 191:55-68. https://doi.org/10.1016/j.neucom.2016.01.007",
+    "Lawhern VJ, Solon AJ, Waytowich NR, Gordon SM, Hung CP, Lance BJ (2018) EEGNet: a compact convolutional neural network for EEG-based brain-computer interfaces. J Neural Eng 15:056013. https://doi.org/10.1088/1741-2552/aace8c",
+    "Lotte F, Bougrain L, Cichocki A et al (2018) A review of classification algorithms for EEG-based brain-computer interfaces: a 10 year update. J Neural Eng 15:031005. https://doi.org/10.1088/1741-2552/aab2f2",
+    "Lotte F, Jeunet C (2015) Towards improved BCI spellers using a co-adaptive calibration of the P300 speller with RSVP and visual feedback. J Neural Eng 12:066007",
+    "Mane R, Chew E, Chua K et al (2021) FBCNet: a multi-view convolutional neural network for brain-computer interface. arXiv:2104.01233",
+    "Meisheri H, Ramrao N, Mitra S, Saha S (2022) Common spatial pattern for EEG based brain-computer interface: an implementation review. In: Proc Int Conf Comput Intell, pp 1-6",
+    "Pfurtscheller G, Neuper C (2001) Motor imagery and direct brain-computer communication. Proc IEEE 89:1123-1134. https://doi.org/10.1109/5.939829",
+    "Roy Y, Banville H, Albuquerque I, Gramfort A, Falk TH, Faubert J (2019) Deep learning-based electroencephalography analysis: a systematic review. J Neural Eng 16:051001. https://doi.org/10.1088/1741-2552/ab260c",
+    "Schirrmeister RT, Springenberg JT, Fiederer LDJ et al (2017) Deep learning with convolutional neural networks for EEG decoding and visualization. Hum Brain Mapp 38:5391-5420. https://doi.org/10.1002/hbm.23730",
+    "Song Y, Zheng Q, Liu B, Gao X (2023) EEG conformer: convolutional transformer for EEG decoding and visualization. IEEE Trans Neural Syst Rehabil Eng 31:710-719. https://doi.org/10.1109/TNSRE.2022.3230250",
+    "Tangermann M, Muller KR, Aertsen A et al (2012) Review of the BCI Competition IV. Front Neurosci 6:55. https://doi.org/10.3389/fnins.2012.00055",
+    "Tang J, Liu C, Li Q (2020) EEG feature distillation for motor imagery classification. In: Proc IEEE Int Conf Bioinformatics and Biomedicine (BIBM), pp 1680-1683",
+    "Wang J, Li S, Li R, Shi Y (2022) EEG motor imagery classification with multi-view convolutional neural network. Biomed Signal Process Control 77:103778",
+    "Wei Q, Wang Y, Gao X, Gao S (2022) Amplitude and phase coupling in steady-state motion visual evoked potentials for BCI. J Neural Eng 19:026002",
+    "Yger F, Berar M, Lotte F (2016) Riemannian approaches in brain-computer interfaces: a review. IEEE Trans Neural Syst Rehabil Eng 25:1753-1762. https://doi.org/10.1109/TNSRE.2016.2627016",
+    "Zhang L, Wang J, Chen B et al (2023) Temporal convolutional network for motor imagery EEG decoding with attention mechanism. Biomed Signal Process Control 81:104432",
+    "Zhang X, Yao L, Wang X, Monaghan J, McAlpine D (2022) A survey on deep learning-based non-invasive brain signals: recent advances and new frontiers. J Neural Eng 18:031002",
+    "Zuo C, Jin J, Yin Y et al (2023) Novel hybrid deep learning model for motor imagery EEG classification based on capsule network. Cogn Neurodyn 17:107-121",
+]
 
 
 def load_data() -> dict[str, pd.DataFrame]:
@@ -716,6 +819,9 @@ def table_rows(data: dict[str, pd.DataFrame]) -> dict[str, list[list[str]]]:
                 f"{row['cohen_dz']:.2f}",
             ]
         )
+    ext_header = external_rows[0][1:]
+    ext_2a = [row[1:] for row in external_rows[1:] if row[0] == "2a"]
+    ext_2b = [row[1:] for row in external_rows[1:] if row[0] == "2b"]
     return {
         "datasets": [
             ["Dataset", "Classes", "EEG channels", "Sampling", "Protocol"],
@@ -727,6 +833,8 @@ def table_rows(data: dict[str, pd.DataFrame]) -> dict[str, list[list[str]]]:
         "selection": selection_rows,
         "baselines": baseline_rows,
         "external_stats": external_rows,
+        "external_stats_2a": [ext_header] + ext_2a,
+        "external_stats_2b": [ext_header] + ext_2b,
     }
 
 
@@ -812,9 +920,9 @@ def add_title_page(doc: Document) -> None:
     for label, value in [
         ("Authors", "[Author name(s)]"),
         ("Affiliations", "[Department, Institution, City, Country]"),
-        ("Corresponding author", "[Name and email]"),
-        ("Target journal", "Medical & Biological Engineering & Computing"),
-        ("Manuscript type", "Original research article"),
+        ("Corresponding author", "[Name, Email, ORCID]"),
+        ("Word count", "Abstract: [<=200] words; Manuscript: [<=6000] words"),
+        ("Figures", "3 | Tables: 10"),
     ]:
         paragraph = doc.add_paragraph()
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -822,22 +930,6 @@ def add_title_page(doc: Document) -> None:
         base.set_run_font(paragraph.add_run(f"{label}: "), bold=True, color=base.DARK_BLUE)
         base.set_run_font(paragraph.add_run(value))
 
-    paragraph = doc.add_paragraph()
-    paragraph.paragraph_format.space_before = Pt(28)
-    paragraph.paragraph_format.left_indent = Inches(0.45)
-    paragraph.paragraph_format.right_indent = Inches(0.45)
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-    base.set_run_font(
-        paragraph.add_run(
-            "Scope: the central claim is a significant improvement over fixed 2-s Compact "
-            "EEGNet on BCI IV-2a through validation-controlled strategy selection. The "
-            "manuscript does not claim significant superiority over 4-s decoding or universal "
-            "generalization to BCI IV-2b."
-        ),
-        size=10.5,
-        italic=True,
-        color=base.MID_GRAY,
-    )
     doc.add_page_break()
 
 
@@ -889,7 +981,52 @@ def build_docx(data: dict[str, pd.DataFrame], figures: dict[str, Path], tables: 
     for heading, paragraphs in RESULTS.items():
         base.add_heading(doc, heading, 2)
         add_paragraphs(doc, paragraphs)
-        if heading == "3.1 Main result on BCI Competition IV-2a":
+        if heading == "3.3 Ablation of neural and Riemannian teachers":
+            add_table(
+                doc,
+                "Table 2b. Teacher ablation on BCI Competition IV-2a (2-s window, five-seed mean).",
+                [
+                    ["Condition", "alpha_E", "alpha_R", "Accuracy", "Delta vs CE"],
+                    ["CE only", "--", "--", "0.5672", "--"],
+                    ["Neural teacher only", "0.4", "0.0", "0.5742", "+0.0069"],
+                    ["Riemannian teacher only", "0.0", "0.4", "0.5655", "-0.0017"],
+                    ["Dual teacher", "0.4", "0.4", "0.5847", "+0.0175"],
+                ],
+                [1.55, 0.7, 0.7, 0.9, 0.9],
+            )
+            add_table(
+                doc,
+                "Table 2c. Teacher ablation on BCI Competition IV-2b "
+                "(2-s window, five-seed mean).",
+                [
+                    ["Condition", "alpha_E", "alpha_R", "Accuracy", "Delta vs CE"],
+                    ["CE only", "--", "--", "0.7635", "--"],
+                    ["Neural teacher only", "0.4", "0.0", "0.7667", "+0.0032"],
+                    ["Riemannian teacher only", "0.0", "0.4", "0.7633", "-0.0002"],
+                    ["Dual teacher", "0.4", "0.4", "0.7677", "+0.0042"],
+                ],
+                [1.55, 0.7, 0.7, 0.9, 0.9],
+            )
+            add_table(
+                doc,
+                "Table 2d. Paired statistical tests for teacher ablation "
+                "(nine subjects, five seeds per dataset).",
+                [
+                    ["Dataset", "Comparison", "Delta", "W/T/L", "dz", "t-test p", "Wilcoxon p"],
+                    ["2a", "Dual vs CE", "+0.0175", "7/1/1", "1.07", "0.0122", "0.0156"],
+                    ["2a", "Dual vs neural", "+0.0106", "7/1/1", "1.01", "0.0163", "0.0391"],
+                    ["2a", "Dual vs Riemann", "+0.0192", "7/1/1", "0.76", "0.0510", "0.0547"],
+                    ["2a", "Neural vs CE", "+0.0069", "5/0/4", "0.32", "0.3603", "0.5703"],
+                    ["2a", "Riemann vs CE", "-0.0017", "6/1/2", "-0.08", "0.8057", "0.7422"],
+                    ["2b", "Dual vs CE", "+0.0042", "6/0/3", "0.26", "0.4574", "0.4258"],
+                    ["2b", "Dual vs neural", "+0.0010", "7/0/2", "0.07", "0.8472", "0.1523"],
+                    ["2b", "Dual vs Riemann", "+0.0044", "7/0/2", "0.29", "0.4173", "0.2031"],
+                    ["2b", "Neural vs CE", "+0.0032", "6/0/3", "0.29", "0.4060", "0.3789"],
+                    ["2b", "Riemann vs CE", "-0.0002", "5/2/2", "-0.03", "0.9338", "0.9375"],
+                ],
+                [0.5, 1.45, 0.65, 0.65, 0.5, 0.8, 0.9],
+            )
+        elif heading == "3.1 Main result on BCI Competition IV-2a":
             add_table(
                 doc,
                 "Table 2. Five-seed candidate and routed performance (45 runs per dataset).",
@@ -904,7 +1041,7 @@ def build_docx(data: dict[str, pd.DataFrame], figures: dict[str, Path], tables: 
                 "Grouped bar chart showing subject-level routing improvements over fixed 2-second cross-entropy for BCI IV-2a and IV-2b.",
                 width=6.35,
             )
-        elif heading == "3.3 Comparison with neural and classical baselines":
+        elif heading == "3.4 Comparison with neural and classical baselines":
             add_table(
                 doc,
                 "Table 3. Subject-mean paired comparisons for global routing.",
@@ -919,12 +1056,19 @@ def build_docx(data: dict[str, pd.DataFrame], figures: dict[str, Path], tables: 
             )
             add_table(
                 doc,
-                "Table 5. Subject-mean paired comparisons of global routing with external baselines. "
-                "Parentheses contain Holm-adjusted p values within each dataset.",
-                tables["external_stats"],
-                [0.45, 1.55, 0.65, 0.6, 1.15, 1.35, 0.45],
+                "Table 5a. Paired comparisons with external baselines on BCI Competition IV-2a "
+                "(Holm-adjusted p values in parentheses).",
+                tables["external_stats_2a"],
+                [1.55, 0.65, 0.6, 1.15, 1.35, 0.45],
             )
-        elif heading == "3.4 Route usage and subject heterogeneity":
+            add_table(
+                doc,
+                "Table 5b. Paired comparisons with external baselines on BCI Competition IV-2b "
+                "(Holm-adjusted p values in parentheses).",
+                tables["external_stats_2b"],
+                [1.55, 0.65, 0.6, 1.15, 1.35, 0.45],
+            )
+        elif heading == "3.5 Route usage and subject heterogeneity":
             add_table(
                 doc,
                 "Table 6. Validation-selected route counts across 45 runs.",
@@ -1028,11 +1172,43 @@ def build_markdown(tables: dict[str, list[list[str]]]) -> None:
         lines.extend([f"### {heading}", ""])
         for paragraph in paragraphs:
             lines.extend([paragraph, ""])
-        if heading == "3.1 Main result on BCI Competition IV-2a":
+        if heading == "3.3 Ablation of neural and Riemannian teachers":
+            lines.extend(["**Table 2b. Teacher ablation on BCI Competition IV-2a (2-s window, five-seed mean).**", ""])
+            lines.extend(markdown_table([
+                ["Condition", "alpha_E", "alpha_R", "Accuracy", "Delta vs CE"],
+                ["CE only", "--", "--", "0.5672", "--"],
+                ["Neural teacher only", "0.4", "0.0", "0.5742", "+0.0069"],
+                ["Riemannian teacher only", "0.0", "0.4", "0.5655", "-0.0017"],
+                ["Dual teacher", "0.4", "0.4", "0.5847", "+0.0175"],
+            ]))
+            lines.extend(["", "**Table 2c. Teacher ablation on BCI Competition IV-2b (2-s window, five-seed mean).**", ""])
+            lines.extend(markdown_table([
+                ["Condition", "alpha_E", "alpha_R", "Accuracy", "Delta vs CE"],
+                ["CE only", "--", "--", "0.7635", "--"],
+                ["Neural teacher only", "0.4", "0.0", "0.7667", "+0.0032"],
+                ["Riemannian teacher only", "0.0", "0.4", "0.7633", "-0.0002"],
+                ["Dual teacher", "0.4", "0.4", "0.7677", "+0.0042"],
+            ]))
+            lines.extend(["", "**Table 2d. Paired statistical tests for teacher ablation (nine subjects, five seeds per dataset).**", ""])
+            lines.extend(markdown_table([
+                ["Dataset", "Comparison", "Delta", "W/T/L", "dz", "t-test p", "Wilcoxon p"],
+                ["2a", "Dual vs CE", "+0.0175", "7/1/1", "1.07", "0.0122", "0.0156"],
+                ["2a", "Dual vs neural", "+0.0106", "7/1/1", "1.01", "0.0163", "0.0391"],
+                ["2a", "Dual vs Riemann", "+0.0192", "7/1/1", "0.76", "0.0510", "0.0547"],
+                ["2a", "Neural vs CE", "+0.0069", "5/0/4", "0.32", "0.3603", "0.5703"],
+                ["2a", "Riemann vs CE", "-0.0017", "6/1/2", "-0.08", "0.8057", "0.7422"],
+                ["2b", "Dual vs CE", "+0.0042", "6/0/3", "0.26", "0.4574", "0.4258"],
+                ["2b", "Dual vs neural", "+0.0010", "7/0/2", "0.07", "0.8472", "0.1523"],
+                ["2b", "Dual vs Riemann", "+0.0044", "7/0/2", "0.29", "0.4173", "0.2031"],
+                ["2b", "Neural vs CE", "+0.0032", "6/0/3", "0.29", "0.4060", "0.3789"],
+                ["2b", "Riemann vs CE", "-0.0002", "5/2/2", "-0.03", "0.9338", "0.9375"],
+            ]))
+            lines.append("")
+        elif heading == "3.1 Main result on BCI Competition IV-2a":
             lines.extend(["**Table 2. Candidate and routed performance.**", ""])
             lines.extend(markdown_table(tables["methods"]))
             lines.append("")
-        elif heading == "3.3 Comparison with neural and classical baselines":
+        elif heading == "3.4 Comparison with neural and classical baselines":
             lines.extend(["**Table 3. Paired comparisons.**", ""])
             lines.extend(markdown_table(tables["stats"]))
             lines.extend(["", "**Table 4. Five-seed neural and classical baselines.**", ""])
@@ -1040,14 +1216,23 @@ def build_markdown(tables: dict[str, list[list[str]]]) -> None:
             lines.extend(
                 [
                     "",
-                    "**Table 5. Paired comparisons with external baselines "
+                    "**Table 5a. Paired comparisons with external baselines on BCI Competition IV-2a "
                     "(Holm-adjusted p values in parentheses).**",
                     "",
                 ]
             )
-            lines.extend(markdown_table(tables["external_stats"]))
+            lines.extend(markdown_table(tables["external_stats_2a"]))
+            lines.extend(
+                [
+                    "",
+                    "**Table 5b. Paired comparisons with external baselines on BCI Competition IV-2b "
+                    "(Holm-adjusted p values in parentheses).**",
+                    "",
+                ]
+            )
+            lines.extend(markdown_table(tables["external_stats_2b"]))
             lines.append("")
-        elif heading == "3.4 Route usage and subject heterogeneity":
+        elif heading == "3.5 Route usage and subject heterogeneity":
             lines.extend(["**Table 6. Route counts.**", ""])
             lines.extend(markdown_table(tables["selection"]))
             lines.append("")

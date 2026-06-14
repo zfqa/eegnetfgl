@@ -23,7 +23,8 @@ def parse_args() -> argparse.Namespace:
         default=["teachers", "ce", "dual_ablation", "riemann_guided", "baselines"],
         choices=["teachers", "ce", "eegnetv4", "dual_ablation", "riemann_guided", "baselines", "all"],
     )
-    parser.add_argument("--root_dir", type=str, default="results/paper_moabb_multiseed")
+    parser.add_argument("--root_dir", type=str, default="results/paper_moabb_multiseed_unified")
+    parser.add_argument("--teacher_root", type=str, default="results/unified_teachers/bci2a")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--teacher_epochs", type=int, default=300)
     parser.add_argument("--eegnetv4_epochs", type=int, default=300)
@@ -85,8 +86,8 @@ def seed_dir(root: Path, group: str, seed: int) -> Path:
     return path
 
 
-def teacher_checkpoint(root: Path, seed: int, subject: int) -> Path:
-    return seed_dir(root, "teachers", seed) / f"subject_{subject}_teacher_best.pth"
+def teacher_checkpoint(teacher_root: Path, seed: int, subject: int) -> Path:
+    return teacher_root / f"seed_{seed}" / f"subject_{subject}_teacher_best.pth"
 
 
 def common_train_args(args: argparse.Namespace, seed: int, save_dir: Path) -> list[str]:
@@ -110,9 +111,10 @@ def common_train_args(args: argparse.Namespace, seed: int, save_dir: Path) -> li
     ]
 
 
-def run_teachers(args: argparse.Namespace, root: Path) -> None:
+def run_teachers(args: argparse.Namespace, teacher_root: Path) -> None:
     for seed in args.seeds:
-        out_dir = seed_dir(root, "teachers", seed)
+        out_dir = teacher_root / f"seed_{seed}"
+        out_dir.mkdir(parents=True, exist_ok=True)
         for subject in args.subjects:
             command = [
                 sys.executable,
@@ -139,6 +141,8 @@ def run_teachers(args: argparse.Namespace, root: Path) -> None:
                 "moabb_standard",
                 "--model_variant",
                 "compact",
+                "--selection_metric",
+                "nll",
             ]
             run_command(command, args.dry_run)
 
@@ -218,7 +222,7 @@ def run_eegnetv4(args: argparse.Namespace, root: Path) -> None:
 
 def dual_command(
     args: argparse.Namespace,
-    root: Path,
+    teacher_root: Path,
     seed: int,
     subject: int,
     out_dir: Path,
@@ -248,6 +252,8 @@ def dual_command(
         str(alpha2),
         "--temperature",
         "1.0",
+        "--teacher_calibration",
+        "temperature",
         "--loss_type",
         "raw_dual_kd",
         "--diffusion_ratio",
@@ -264,16 +270,26 @@ def dual_command(
         "none",
         "--riemann_metric",
         "riemann",
+        "--riemann_selection",
+        "inner_cv",
+        "--riemann_selection_folds",
+        "5",
         "--riemann_c_grid",
         "0.01,0.03,0.1,0.3,1,3,10",
         *common_train_args(args, seed, out_dir),
     ]
     if teacher_mode in {"eegnet", "dual"}:
-        command.extend(["--eegnet_teacher_path", str(teacher_checkpoint(root, seed, subject))])
+        checkpoint = teacher_checkpoint(teacher_root, seed, subject)
+        if not args.dry_run and not checkpoint.exists():
+            raise FileNotFoundError(
+                f"Validated BCI2a teacher not found: {checkpoint}. "
+                "Run this matrix with --groups teachers first."
+            )
+        command.extend(["--eegnet_teacher_path", str(checkpoint)])
     return command
 
 
-def run_dual_ablation(args: argparse.Namespace, root: Path) -> None:
+def run_dual_ablation(args: argparse.Namespace, root: Path, teacher_root: Path) -> None:
     experiments = [
         ("EEGNet teacher only", "eegnet", 0.4, 0.0),
         ("Riemann teacher only", "riemann", 0.0, 0.4),
@@ -283,7 +299,17 @@ def run_dual_ablation(args: argparse.Namespace, root: Path) -> None:
         out_dir = seed_dir(root, "dual_ablation", seed)
         for subject in args.subjects:
             for name, teacher_mode, alpha1, alpha2 in experiments:
-                command = dual_command(args, root, seed, subject, out_dir, name, teacher_mode, alpha1, alpha2)
+                command = dual_command(
+                    args,
+                    teacher_root,
+                    seed,
+                    subject,
+                    out_dir,
+                    name,
+                    teacher_mode,
+                    alpha1,
+                    alpha2,
+                )
                 run_command(command, args.dry_run)
 
 
@@ -336,7 +362,23 @@ def run_riemann_guided(args: argparse.Namespace, root: Path) -> None:
                     "--geometry_trust_mode",
                     "sample",
                     "--confidence_mode",
-                    "normalized",
+                    "none",
+                    "--teacher_calibration",
+                    "temperature",
+                    "--riemann_cov_estimator",
+                    "oas",
+                    "--riemann_alignment",
+                    "none",
+                    "--riemann_metric",
+                    "riemann",
+                    "--riemann_method",
+                    "ts_logreg",
+                    "--riemann_selection",
+                    "inner_cv",
+                    "--riemann_selection_folds",
+                    "5",
+                    "--c_grid",
+                    "0.01,0.03,0.1,0.3,1,3,10",
                     "--trust_gate_mode",
                     "confidence",
                     *common_train_args(args, seed, out_dir),
@@ -354,7 +396,17 @@ def run_baselines(args: argparse.Namespace, root: Path) -> None:
         for subject in args.subjects:
             for window in [2.0, 4.0]:
                 riem_done = all(
-                    csv_has_result(riem_csv, subject=subject, seed=seed, window=window, method=method)
+                    csv_has_result(
+                        riem_csv,
+                        subject=subject,
+                        seed=seed,
+                        window=window,
+                        method=method,
+                        input_preprocessing="raw",
+                        calibration="temperature",
+                        selection="inner_cv",
+                        selection_folds=5,
+                    )
                     for method in ["mdm", "ts_logreg"]
                 )
                 if riem_done and not args.rerun_existing:
@@ -379,6 +431,10 @@ def run_baselines(args: argparse.Namespace, root: Path) -> None:
                             "oas",
                             "--alignments",
                             "none",
+                            "--selection",
+                            "inner_cv",
+                            "--selection_folds",
+                            "5",
                             "--metric",
                             "riemann",
                             "--fmin",
@@ -438,16 +494,17 @@ def main() -> None:
     base_env()
     groups = expand_groups(args.groups)
     root = Path(args.root_dir)
+    teacher_root = Path(args.teacher_root)
     root.mkdir(parents=True, exist_ok=True)
 
     if "teachers" in groups:
-        run_teachers(args, root)
+        run_teachers(args, teacher_root)
     if "ce" in groups:
         run_ce(args, root)
     if "eegnetv4" in groups:
         run_eegnetv4(args, root)
     if "dual_ablation" in groups:
-        run_dual_ablation(args, root)
+        run_dual_ablation(args, root, teacher_root)
     if "riemann_guided" in groups:
         run_riemann_guided(args, root)
     if "baselines" in groups:

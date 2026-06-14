@@ -30,6 +30,7 @@ from utils.data_loader import (
     standardize_by_train,
 )
 from utils.seed import set_seed
+from utils.teacher_utils import apply_temperature_scaling, fit_temperature_scaling
 from utils.train_utils import EarlyStopping, append_or_update_csv, evaluate, resolve_device, strip_arrays
 from utils.windowing import adaptive_crop_trials
 
@@ -54,6 +55,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha_eegnet", type=float, default=0.4)
     parser.add_argument("--alpha_riemann", type=float, default=0.4)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--teacher_calibration", type=str, default="temperature", choices=["none", "temperature"])
+    parser.add_argument("--riemann_selection", type=str, default="inner_cv", choices=["validation", "inner_cv"])
+    parser.add_argument("--riemann_selection_folds", type=int, default=5)
     parser.add_argument("--val_ratio", type=float, default=0.2)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save_dir", type=str, default="results/bci2a_adaptive_dual_teacher_seed42")
@@ -179,6 +183,22 @@ def main() -> None:
         teacher_path,
         X_teacher_train.shape[-1],
         device,
+        expected_channels=X_teacher_train.shape[1],
+        expected_classes=4,
+        expected_subject=args.subject,
+        expected_seed=args.seed,
+        expected_dataset="bci2a",
+        expected_selection_metric="nll",
+        expected_preprocess={
+            "fmin": 8.0,
+            "fmax": 32.0,
+            "tmin": 0.0,
+            "tmax": 4.0,
+            "fs": 250,
+            "val_ratio": float(args.val_ratio),
+            "protocol": "moabb_standard",
+            "standardization": "train_channel",
+        },
     )
     eegnet_train_logits = collect_eegnet_teacher_logits(
         eegnet_teacher, X_teacher_train, args.batch_size, device
@@ -186,6 +206,11 @@ def main() -> None:
     eegnet_val_logits = collect_eegnet_teacher_logits(
         eegnet_teacher, X_teacher_val, args.batch_size, device
     )
+    eegnet_calibration_temperature = 1.0
+    if args.teacher_calibration == "temperature":
+        eegnet_calibration_temperature, _ = fit_temperature_scaling(eegnet_val_logits, y_val)
+        eegnet_train_logits = apply_temperature_scaling(eegnet_train_logits, eegnet_calibration_temperature)
+        eegnet_val_logits = apply_temperature_scaling(eegnet_val_logits, eegnet_calibration_temperature)
     del eegnet_teacher
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -203,6 +228,9 @@ def main() -> None:
         method="ts_logreg",
         c_grid=parse_grid("0.01,0.03,0.1,0.3,1,3,10"),
         euclid_shrinkage=0.001,
+        calibration=args.teacher_calibration,
+        selection=args.riemann_selection,
+        selection_folds=args.riemann_selection_folds,
     )
     if not (
         len(X_student_train)
@@ -328,6 +356,10 @@ def main() -> None:
         "alpha_eegnet": args.alpha_eegnet,
         "alpha_riemann": args.alpha_riemann,
         "temperature": args.temperature,
+        "teacher_calibration": args.teacher_calibration,
+        "eegnet_calibration_temperature": eegnet_calibration_temperature,
+        "riemann_selection": args.riemann_selection,
+        "riemann_selection_folds": args.riemann_selection_folds,
         "threshold": crop_kwargs["threshold"],
         "consecutive_k": crop_kwargs["consecutive_k"],
         "fallback_start": crop_kwargs["fallback_start"],
@@ -352,7 +384,15 @@ def main() -> None:
     append_or_update_csv(
         results_path,
         row,
-        key_columns=["dataset", "subject", "seed", "strategy"],
+        key_columns=[
+            "dataset",
+            "subject",
+            "seed",
+            "strategy",
+            "teacher_calibration",
+            "riemann_selection",
+            "riemann_selection_folds",
+        ],
     )
     print(
         f"Adaptive dual test | acc={row['accuracy']:.4f} | "

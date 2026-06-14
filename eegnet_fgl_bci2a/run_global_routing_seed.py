@@ -15,6 +15,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--patience", type=int, default=100)
+    parser.add_argument("--output_root", type=str, default="results/global_routing_multiseed_unified")
+    parser.add_argument("--teacher_root", type=str, default="results/unified_teachers")
+    parser.add_argument("--paper2a_root", type=str, default="results/paper_moabb_multiseed_unified")
+    parser.add_argument("--paper2b_root", type=str, default="results/bci2b_paper_multiseed_unified")
+    parser.add_argument("--rerun_existing", action="store_true")
     return parser.parse_args()
 
 
@@ -23,30 +28,40 @@ def run(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
-def csv_has(path: Path, subject: int, seed: int) -> bool:
+def csv_has(path: Path, subject: int, seed: int, **conditions: object) -> bool:
     if not path.exists():
         return False
     rows = pd.read_csv(path)
-    return bool(
-        ((rows["subject"].astype(int) == subject) & (rows["seed"].astype(int) == seed)).any()
-    )
+    mask = (rows["subject"].astype(int) == subject) & (rows["seed"].astype(int) == seed)
+    for column, expected in conditions.items():
+        if column not in rows.columns:
+            return False
+        if isinstance(expected, float):
+            mask &= pd.to_numeric(rows[column], errors="coerce").sub(expected).abs() < 1e-8
+        else:
+            mask &= rows[column].astype(str) == str(expected)
+    return bool(mask.any())
 
 
-def bci2b_teacher_path(subject: int, seed: int) -> Path:
-    root = Path("results/bci2b_paper_multiseed") / f"seed_{seed}" / "eegnetv4_4s_teacher"
-    matches = list(root.glob(f"bci2b_subject_{subject}_eegnetv4_window_4_*_best.pth"))
-    if not matches and seed == 42:
-        root = Path("results/bci2b_eegnetv4_4s_teachers_seed42")
-        matches = list(root.glob(f"bci2b_subject_{subject}_eegnetv4_window_4_*_best.pth"))
-    if len(matches) != 1:
-        raise FileNotFoundError(f"Expected one BCI2b teacher, found {len(matches)} in {root}.")
-    return matches[0]
+def unified_teacher_path(root: Path, dataset: str, subject: int, seed: int) -> Path:
+    if dataset == "bci2a":
+        name = f"subject_{subject}_teacher_best.pth"
+    else:
+        name = f"bci2b_subject_{subject}_eegnetv4_teacher_best.pth"
+    path = root / dataset / f"seed_{seed}" / name
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Validated {dataset} teacher not found: {path}. "
+            "Run run_unified_teacher_matrix.py for this subject/seed first."
+        )
+    return path
 
 
 def main() -> None:
     args = parse_args()
     python = sys.executable
-    seed_root = Path("results/global_routing_multiseed") / f"seed_{args.seed}"
+    teacher_root = Path(args.teacher_root)
+    seed_root = Path(args.output_root) / f"seed_{args.seed}"
     bci2a_candidates = seed_root / "bci2a_candidates"
     bci2a_dual = seed_root / "bci2a_adaptive_dual"
     bci2b_candidates = seed_root / "bci2b_candidates"
@@ -56,7 +71,7 @@ def main() -> None:
 
     for subject in args.subjects:
         bci2a_ce_csv = bci2a_candidates / "routing_ce_results.csv"
-        if not csv_has(bci2a_ce_csv, subject, args.seed):
+        if args.rerun_existing or not csv_has(bci2a_ce_csv, subject, args.seed):
             run(
                 [
                     python,
@@ -78,12 +93,15 @@ def main() -> None:
                 ]
             )
         bci2a_dual_csv = bci2a_dual / "adaptive_dual_results.csv"
-        if not csv_has(bci2a_dual_csv, subject, args.seed):
-            teacher = (
-                Path("results/paper_moabb_multiseed/teachers")
-                / f"seed_{args.seed}"
-                / f"subject_{subject}_teacher_best.pth"
-            )
+        if args.rerun_existing or not csv_has(
+            bci2a_dual_csv,
+            subject,
+            args.seed,
+            teacher_calibration="temperature",
+            riemann_selection="inner_cv",
+            riemann_selection_folds=5,
+        ):
+            teacher = unified_teacher_path(teacher_root, "bci2a", subject, args.seed)
             run(
                 [
                     python,
@@ -106,11 +124,17 @@ def main() -> None:
                     str(bci2a_candidates),
                     "--eegnet_teacher_path",
                     str(teacher),
+                    "--teacher_calibration",
+                    "temperature",
+                    "--riemann_selection",
+                    "inner_cv",
+                    "--riemann_selection_folds",
+                    "5",
                 ]
             )
 
         bci2b_ce_csv = bci2b_candidates / "routing_ce_results.csv"
-        if not csv_has(bci2b_ce_csv, subject, args.seed):
+        if args.rerun_existing or not csv_has(bci2b_ce_csv, subject, args.seed):
             run(
                 [
                     python,
@@ -132,7 +156,15 @@ def main() -> None:
                 ]
             )
         bci2b_dual_csv = bci2b_dual / "detector_dual_teacher_results.csv"
-        if not csv_has(bci2b_dual_csv, subject, args.seed):
+        if args.rerun_existing or not csv_has(
+            bci2b_dual_csv,
+            subject,
+            args.seed,
+            teacher_calibration="temperature",
+            confidence_mode="none",
+            riemann_selection="inner_cv",
+            riemann_selection_folds=5,
+        ):
             run(
                 [
                     python,
@@ -148,7 +180,7 @@ def main() -> None:
                         / "eegnetv4_05s_sliding_detector_best.pth"
                     ),
                     "--eegnet_teacher_path",
-                    str(bci2b_teacher_path(subject, args.seed)),
+                    str(unified_teacher_path(teacher_root, "bci2b", subject, args.seed)),
                     "--detector_win",
                     "1.0",
                     "--detector_step",
@@ -157,6 +189,14 @@ def main() -> None:
                     "2.0",
                     "--smooth_k",
                     "3",
+                    "--teacher_calibration",
+                    "temperature",
+                    "--confidence_mode",
+                    "none",
+                    "--riemann_selection",
+                    "inner_cv",
+                    "--riemann_selection_folds",
+                    "5",
                     "--epochs",
                     str(args.epochs),
                     "--patience",
@@ -187,6 +227,10 @@ def main() -> None:
                 str(candidates),
                 "--adaptive_dual_root",
                 str(dual),
+                "--paper2a_root",
+                args.paper2a_root,
+                "--paper2b_root",
+                args.paper2b_root,
                 "--device",
                 args.device,
                 "--output_dir",

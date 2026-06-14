@@ -17,6 +17,7 @@ from utils.data_loader import (
     standardize_by_train,
 )
 from utils.seed import set_seed
+from utils.teacher_utils import load_frozen_eegnet_teacher as load_validated_eegnet_teacher
 from utils.train_utils import (
     EarlyStopping,
     append_or_update_csv,
@@ -92,28 +93,16 @@ def load_frozen_teacher(
     fs: int,
     n_teacher_samples: int,
     device: torch.device,
-) -> tuple[EEGNet, dict, float]:
-    if not teacher_path.exists():
-        raise FileNotFoundError(f"Teacher checkpoint not found: {teacher_path}")
-
-    checkpoint = torch.load(teacher_path, map_location=device)
-    model_args = checkpoint.get("model_args")
-    if model_args is None:
-        raise KeyError(f"Checkpoint does not contain model_args: {teacher_path}")
-
-    expected_samples = int(model_args["n_samples"])
+    **expectations,
+) -> tuple[torch.nn.Module, dict, float]:
+    teacher, checkpoint = load_validated_eegnet_teacher(
+        teacher_path,
+        device,
+        expected_samples=n_teacher_samples,
+        **expectations,
+    )
+    expected_samples = int(checkpoint["model_args"]["n_samples"])
     resolved_window = teacher_window if teacher_window is not None else expected_samples / fs
-    if n_teacher_samples != expected_samples:
-        raise ValueError(
-            f"Teacher checkpoint expects {expected_samples} samples, but teacher_window={resolved_window:g}s "
-            f"at {fs}Hz produced {n_teacher_samples} samples."
-        )
-
-    teacher = EEGNet(**model_args).to(device)
-    teacher.load_state_dict(checkpoint["model_state_dict"])
-    teacher.eval()
-    for parameter in teacher.parameters():
-        parameter.requires_grad_(False)
     return teacher, checkpoint, resolved_window
 
 
@@ -185,6 +174,19 @@ def main() -> None:
             args.fs,
             X_train_teacher.shape[2],
             device,
+            expected_channels=X_train_teacher.shape[1],
+            expected_classes=4,
+            expected_subject=args.subject,
+            expected_seed=args.seed,
+            expected_dataset="bci2a",
+            expected_preprocess={
+                "fmin": float(args.fmin),
+                "fmax": float(args.fmax),
+                "tmin": float(args.tmin),
+                "tmax": float(args.tmax),
+                "fs": int(args.fs),
+                "val_ratio": float(args.val_ratio),
+            },
         )
 
         train_loader = DataLoader(

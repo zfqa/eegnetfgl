@@ -12,7 +12,6 @@ from utils.data_loader import (
     crop_time_window,
     load_bci2a_subject,
     split_session_train_val_test,
-    standardize_by_train,
 )
 from utils.metrics import evaluate_metrics
 from utils.riemann import (
@@ -187,7 +186,6 @@ def main() -> None:
     X_train, y_train, X_val, y_val, X_test, y_test = split_session_train_val_test(
         X, y, metadata, val_ratio=args.val_ratio, seed=args.seed
     )
-    X_train, X_val, X_test = standardize_by_train(X_train, X_val, X_test)
     X_train = crop_time_window(X_train, seconds=args.window, fs=args.fs)
     X_val = crop_time_window(X_val, seconds=args.window, fs=args.fs)
     X_test = crop_time_window(X_test, seconds=args.window, fs=args.fs)
@@ -228,11 +226,20 @@ def main() -> None:
             val_macro_f1=float(val_metrics["macro_f1"]),
             val_kappa=float(val_metrics["kappa"]),
             cov_shrinkage=args.cov_shrinkage,
+            input_preprocessing="raw",
         )
         append_or_update_csv(
             save_dir / "riemann_baseline_results.csv",
             row,
-            key_columns=["method", "subject", "window", "seed", "classifier", "cov_shrinkage"],
+            key_columns=[
+                "method",
+                "subject",
+                "window",
+                "seed",
+                "classifier",
+                "cov_shrinkage",
+                "input_preprocessing",
+            ],
         )
 
 

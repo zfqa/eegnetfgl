@@ -3,15 +3,18 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from models import EEGNet, EEGNetV4
 from utils.data_loader import (
     EEGDataset,
+    MOABB_BCI2B_STANDARD_PROTOCOL,
     apply_bci2a_protocol_defaults,
     crop_time_window,
     load_bci2a_subject,
+    load_bci2b_subject,
     split_session_train_val_test,
     standardize_by_train,
 )
@@ -28,8 +31,9 @@ from utils.train_utils import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a full-window EEGNet teacher on BNCI2014_001.")
+    parser = argparse.ArgumentParser(description="Train a full-window EEGNet teacher on BCI IV-2a/2b.")
     parser.add_argument("--subject", type=int, default=1)
+    parser.add_argument("--dataset", type=str, default="bci2a", choices=["bci2a", "bci2b"])
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=0.001)
@@ -46,11 +50,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fs", type=int, default=250)
     parser.add_argument("--val_ratio", type=float, default=0.2)
     parser.add_argument("--patience", type=int, default=100)
+    parser.add_argument(
+        "--selection_metric",
+        type=str,
+        default="nll",
+        choices=["nll", "accuracy"],
+        help="NLL is preferred when the teacher will provide soft labels.",
+    )
     parser.add_argument("--dropout_rate", type=float, default=0.5)
     parser.add_argument("--F1", type=int, default=8)
     parser.add_argument("--D", type=int, default=2)
     parser.add_argument("--F2", type=int, default=16)
-    parser.add_argument("--kernel_length", type=int, default=64)
+    parser.add_argument(
+        "--kernel_length",
+        type=int,
+        default=None,
+        help="Defaults to 64 for Compact EEGNet and 125 for EEGNetV4.",
+    )
     parser.add_argument("--separable_kernel_length", type=int, default=16)
     parser.add_argument("--pool1", type=int, default=4)
     parser.add_argument("--pool2", type=int, default=8)
@@ -62,27 +78,33 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_teacher_model(args: argparse.Namespace, n_channels: int, n_samples: int) -> torch.nn.Module:
+def build_teacher_model(
+    args: argparse.Namespace,
+    n_channels: int,
+    n_samples: int,
+    n_classes: int,
+) -> torch.nn.Module:
+    kernel_length = args.kernel_length if args.kernel_length is not None else (125 if args.model_variant == "eegnetv4" else 64)
     if args.model_variant == "compact":
         return EEGNet(
             n_channels=n_channels,
             n_samples=n_samples,
-            n_classes=4,
+            n_classes=n_classes,
             dropout_rate=args.dropout_rate,
             F1=args.F1,
             D=args.D,
             F2=args.F2,
-            kernel_length=args.kernel_length,
+            kernel_length=kernel_length,
         )
     return EEGNetV4(
         n_channels=n_channels,
         n_samples=n_samples,
-        n_classes=4,
+        n_classes=n_classes,
         dropout_rate=args.dropout_rate,
         F1=args.F1,
         D=args.D,
         F2=args.F2,
-        kernel_length=args.kernel_length,
+        kernel_length=kernel_length,
         separable_kernel_length=args.separable_kernel_length,
         pool1=args.pool1,
         pool2=args.pool2,
@@ -94,16 +116,17 @@ def build_teacher_model(args: argparse.Namespace, n_channels: int, n_samples: in
     )
 
 
-def teacher_model_args(args: argparse.Namespace, n_channels: int, n_samples: int) -> dict:
+def teacher_model_args(args: argparse.Namespace, n_channels: int, n_samples: int, n_classes: int) -> dict:
+    kernel_length = args.kernel_length if args.kernel_length is not None else (125 if args.model_variant == "eegnetv4" else 64)
     common = {
         "n_channels": n_channels,
         "n_samples": n_samples,
-        "n_classes": 4,
+        "n_classes": n_classes,
         "dropout_rate": args.dropout_rate,
         "F1": args.F1,
         "D": args.D,
         "F2": args.F2,
-        "kernel_length": args.kernel_length,
+        "kernel_length": kernel_length,
     }
     if args.model_variant == "compact":
         return common
@@ -120,16 +143,21 @@ def teacher_model_args(args: argparse.Namespace, n_channels: int, n_samples: int
     }
 
 
-def teacher_checkpoint_name(subject: int, model_variant: str) -> str:
+def teacher_checkpoint_name(subject: int, model_variant: str, dataset: str = "bci2a") -> str:
+    prefix = "" if dataset == "bci2a" else f"{dataset}_"
     if model_variant == "compact":
-        return f"subject_{subject}_teacher_best.pth"
-    return f"subject_{subject}_{model_variant}_teacher_best.pth"
+        return f"{prefix}subject_{subject}_teacher_best.pth"
+    return f"{prefix}subject_{subject}_{model_variant}_teacher_best.pth"
 
 
 def main() -> None:
     args = parse_args()
     if args.protocol == "moabb_standard":
-        protocol_defaults = apply_bci2a_protocol_defaults(args.protocol)
+        protocol_defaults = (
+            apply_bci2a_protocol_defaults(args.protocol)
+            if args.dataset == "bci2a"
+            else MOABB_BCI2B_STANDARD_PROTOCOL
+        )
         args.fmin = float(protocol_defaults["fmin"])
         args.fmax = float(protocol_defaults["fmax"])
         args.tmin = float(protocol_defaults["tmin"])
@@ -139,15 +167,17 @@ def main() -> None:
     device = resolve_device(args.device)
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = save_dir / teacher_checkpoint_name(args.subject, args.model_variant)
+    checkpoint_path = save_dir / teacher_checkpoint_name(args.subject, args.model_variant, args.dataset)
 
-    X, y, metadata = load_bci2a_subject(
+    loader = load_bci2b_subject if args.dataset == "bci2b" else load_bci2a_subject
+    X, y, metadata = loader(
         args.subject,
         fmin=args.fmin,
         fmax=args.fmax,
         tmin=args.tmin,
         tmax=args.tmax,
     )
+    n_classes = int(np.max(y)) + 1
     X_train, y_train, X_val, y_val, X_test, y_test = split_session_train_val_test(
         X, y, metadata, val_ratio=args.val_ratio, seed=args.seed
     )
@@ -167,12 +197,15 @@ def main() -> None:
     val_loader = DataLoader(EEGDataset(X_val, y_val), batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(EEGDataset(X_test, y_test), batch_size=args.batch_size, shuffle=False)
 
-    model = build_teacher_model(args, X_train.shape[1], X_train.shape[2]).to(device)
+    model = build_teacher_model(args, X_train.shape[1], X_train.shape[2], n_classes).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    stopper = EarlyStopping(patience=args.patience, mode="max")
+    stopper = EarlyStopping(
+        patience=args.patience,
+        mode="min" if args.selection_metric == "nll" else "max",
+    )
 
     print(
-        f"Subject {args.subject} {args.model_variant} teacher four-class CE: "
+        f"{args.dataset} subject {args.subject} {args.model_variant} teacher {n_classes}-class CE: "
         f"train={len(y_train)}, val={len(y_val)}, "
         f"test={len(y_test)}, shape={X_train.shape[1:]}, device={device}, "
         f"protocol={args.protocol}, band={args.fmin:g}-{args.fmax:g}Hz, t={args.tmin:g}-{args.tmax:g}s"
@@ -180,17 +213,19 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch_ce(model, train_loader, optimizer, device)
         val_metrics = evaluate(model, val_loader, device)
+        selection_value = val_metrics["loss"] if args.selection_metric == "nll" else val_metrics["accuracy"]
         improved = stopper.step(
-            val_metrics["accuracy"],
+            selection_value,
             model,
             checkpoint_path,
             epoch,
             extra={
                 "subject": args.subject,
+                "dataset": args.dataset,
                 "n_channels": X_train.shape[1],
                 "n_samples": X_train.shape[2],
                 "model_variant": args.model_variant,
-                "model_args": teacher_model_args(args, X_train.shape[1], X_train.shape[2]),
+                "model_args": teacher_model_args(args, X_train.shape[1], X_train.shape[2], n_classes),
                 "split_seed": args.seed,
                 "preprocess": {
                     "fmin": args.fmin,
@@ -200,14 +235,18 @@ def main() -> None:
                     "fs": args.fs,
                     "val_ratio": args.val_ratio,
                     "protocol": args.protocol,
+                    "standardization": "train_channel",
                 },
                 "val_metrics": strip_arrays(val_metrics),
+                "selection_metric": args.selection_metric,
+                "selection_value": float(selection_value),
             },
         )
         mark = "*" if improved else ""
         print(
             f"Epoch {epoch:03d}/{args.epochs} | train_loss={train_loss:.4f} | "
-            f"val_acc={val_metrics['accuracy']:.4f} | val_f1={val_metrics['macro_f1']:.4f} | "
+            f"val_nll={val_metrics['loss']:.4f} | val_acc={val_metrics['accuracy']:.4f} | "
+            f"val_f1={val_metrics['macro_f1']:.4f} | "
             f"val_kappa={val_metrics['kappa']:.4f} {mark}"
         )
         if stopper.should_stop:
@@ -224,12 +263,14 @@ def main() -> None:
 
     row = metric_row(
         method="EEGNetV4-Teacher-4s" if args.model_variant == "eegnetv4" else "EEGNet-Teacher-4s",
+        dataset=args.dataset,
         subject=args.subject,
         window=4.0,
         metrics=test_metrics,
         best_epoch=int(checkpoint["epoch"]),
         seed=args.seed,
         model_variant=args.model_variant,
+        selection_metric=args.selection_metric,
         protocol=args.protocol,
         fmin=args.fmin,
         fmax=args.fmax,
@@ -239,7 +280,16 @@ def main() -> None:
     append_or_update_csv(
         save_dir / "teacher_results.csv",
         row,
-        key_columns=["method", "subject", "window", "seed", "protocol", "model_variant"],
+        key_columns=[
+            "method",
+            "dataset",
+            "subject",
+            "window",
+            "seed",
+            "protocol",
+            "model_variant",
+            "selection_metric",
+        ],
     )
 
 

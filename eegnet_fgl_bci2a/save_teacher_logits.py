@@ -5,17 +5,20 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 
-from models import EEGNet
 from utils.data_loader import (
-    EEGDataset,
     crop_time_window,
     load_bci2a_subject,
     split_session_train_val_test,
     standardize_by_train,
 )
 from utils.seed import set_seed
+from utils.teacher_utils import (
+    apply_temperature_scaling,
+    collect_teacher_logits,
+    fit_temperature_scaling,
+    load_frozen_eegnet_teacher,
+)
 from utils.train_utils import resolve_device
 
 
@@ -33,17 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tmax", type=float, default=4)
     parser.add_argument("--fs", type=int, default=250)
     parser.add_argument("--val_ratio", type=float, default=0.2)
+    parser.add_argument("--teacher_calibration", type=str, default="temperature", choices=["none", "temperature"])
     return parser.parse_args()
-
-
-@torch.no_grad()
-def collect_logits(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> np.ndarray:
-    model.eval()
-    logits_list = []
-    for x, _ in loader:
-        logits = model(x.to(device))
-        logits_list.append(logits.cpu().numpy())
-    return np.concatenate(logits_list, axis=0)
 
 
 def main() -> None:
@@ -72,18 +66,34 @@ def main() -> None:
     X_train = crop_time_window(X_train, seconds=teacher_seconds, fs=args.fs)
     X_val = crop_time_window(X_val, seconds=teacher_seconds, fs=args.fs)
 
-    checkpoint = torch.load(teacher_path, map_location=device)
-    model_args = checkpoint.get(
-        "model_args",
-        {"n_channels": X_train.shape[1], "n_samples": X_train.shape[2], "n_classes": 4},
+    model, checkpoint = load_frozen_eegnet_teacher(
+        teacher_path,
+        device,
+        expected_samples=X_train.shape[2],
+        expected_channels=X_train.shape[1],
+        expected_classes=4,
+        expected_subject=args.subject,
+        expected_seed=args.seed,
+        expected_dataset="bci2a",
+        expected_selection_metric="nll",
+        expected_preprocess={
+            "fmin": float(args.fmin),
+            "fmax": float(args.fmax),
+            "tmin": float(args.tmin),
+            "tmax": float(args.tmax),
+            "fs": int(args.fs),
+            "val_ratio": float(args.val_ratio),
+            "protocol": "moabb_standard",
+            "standardization": "train_channel",
+        },
     )
-    model = EEGNet(**model_args).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-
-    train_loader = DataLoader(EEGDataset(X_train, y_train), batch_size=args.batch_size, shuffle=False)
-    val_loader = DataLoader(EEGDataset(X_val, y_val), batch_size=args.batch_size, shuffle=False)
-    train_logits = collect_logits(model, train_loader, device)
-    val_logits = collect_logits(model, val_loader, device)
+    train_logits = collect_teacher_logits(model, X_train, args.batch_size, device)
+    val_logits = collect_teacher_logits(model, X_val, args.batch_size, device)
+    calibration_temperature = 1.0
+    if args.teacher_calibration == "temperature":
+        calibration_temperature, _ = fit_temperature_scaling(val_logits, y_val)
+        train_logits = apply_temperature_scaling(train_logits, calibration_temperature)
+        val_logits = apply_temperature_scaling(val_logits, calibration_temperature)
 
     train_path = save_dir / f"subject_{args.subject}_train_logits.npy"
     val_path = save_dir / f"subject_{args.subject}_val_logits.npy"
@@ -91,6 +101,10 @@ def main() -> None:
     np.save(val_path, val_logits)
     print(f"Saved train logits: {train_path} {train_logits.shape}")
     print(f"Saved val logits:   {val_path} {val_logits.shape}")
+    print(
+        f"Teacher={checkpoint.get('model_variant', 'compact')} | "
+        f"calibration={args.teacher_calibration} | T={calibration_temperature:.4f}"
+    )
     print("No test logits were saved or used for student training.")
 
 
