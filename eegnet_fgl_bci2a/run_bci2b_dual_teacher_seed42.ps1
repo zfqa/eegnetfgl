@@ -13,7 +13,7 @@ $studentDir = "results\bci2b_compact_2s_dual_teacher_seed42"
 New-Item -ItemType Directory -Force -Path $teacherDir, $studentDir | Out-Null
 
 foreach ($subject in 1..9) {
-    $teacherPth = Join-Path $teacherDir "bci2b_subject_${subject}_compact_teacher_best.pth"
+    $teacherPth = Join-Path $teacherDir "bci2b_subject_${subject}_teacher_best.pth"
 
     Write-Output "=== Subject ${subject}: train 4s compact teacher ==="
     & $python $teacherScript `

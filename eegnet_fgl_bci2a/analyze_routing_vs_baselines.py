@@ -13,7 +13,9 @@ METHODS = [
     "EEGNetV4 2s CE",
     "RiemannPaper-TS-LogReg 2s",
     "CSP-LDA 2s",
+    "FBCSP-LDA 2s",
     "CSP-LDA 4s",
+    "FBCSP-LDA 4s",
     "EEGNetV4 4s CE",
     "RiemannPaper-TS-LogReg 4s",
 ]
@@ -54,7 +56,17 @@ def load_baselines(dataset: str) -> pd.DataFrame:
             / "publication_complete_analysis"
             / "bci2b_classical_rows_deduplicated.csv"
         )
-    frame = pd.concat([neural, classical], ignore_index=True, sort=False)
+    fbcsp_path = RESULTS / "fbcsp_lda_8_32_subject_seed.csv"
+    if fbcsp_path.exists():
+        fbcsp = pd.read_csv(fbcsp_path)
+        fbcsp = fbcsp[fbcsp["dataset"] == dataset].copy()
+        fbcsp["label"] = fbcsp.apply(
+            lambda r: f"FBCSP-LDA {int(r['window'])}s", axis=1
+        )
+        fbcsp = fbcsp.rename(columns={"accuracy": "accuracy"})
+    else:
+        fbcsp = pd.DataFrame()
+    frame = pd.concat([neural, classical, fbcsp], ignore_index=True, sort=False)
     return frame[frame["label"].isin(METHODS)].copy()
 
 

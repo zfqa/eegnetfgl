@@ -154,6 +154,32 @@ def bci2b_fixed_paths(root: Path, subject: int, seed: int) -> tuple[Path, Path]:
     return fixed_ce, fixed_dual
 
 
+def bci2b_adaptive_path(root: Path, subject: int, seed: int) -> Path:
+    csv_path = root / "detector_dual_teacher_results.csv"
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Adaptive dual results not found: {csv_path}")
+    rows = pd.read_csv(csv_path)
+    mask = (
+        (rows["subject"].astype(int) == subject)
+        & (rows["seed"].astype(int) == seed)
+        & (rows["teacher_calibration"].astype(str) == "temperature")
+        & (rows["confidence_mode"].astype(str) == "none")
+        & (rows["riemann_input_preprocessing"].astype(str) == "raw")
+        & (rows["riemann_selection"].astype(str) == "inner_cv")
+        & (rows["riemann_selection_folds"].astype(int) == 5)
+        & np.isclose(rows["alpha_eegnet"].astype(float), 0.4)
+        & np.isclose(rows["alpha_riemann"].astype(float), 0.4)
+        & np.isclose(rows["spatial_structure_weight"].astype(float), 0.0)
+    )
+    selected = rows[mask]
+    if len(selected) != 1:
+        raise ValueError(
+            f"Expected one unified BCI2b adaptive-dual row for subject={subject}, "
+            f"seed={seed}; found {len(selected)}."
+        )
+    return Path(selected.iloc[0]["checkpoint"])
+
+
 def bci2a_windows(
     subject: int,
     seed: int,
@@ -236,7 +262,7 @@ def main() -> None:
                 subject, fmin=8.0, fmax=32.0, tmin=0.0, tmax=4.0
             )
             fixed_ce, fixed_dual = bci2b_fixed_paths(paper2b_root, subject, args.seed)
-            adaptive_dual = adaptive_dual_root / f"subject_{subject}_stable_peak_dual_teacher_best.pth"
+            adaptive_dual = bci2b_adaptive_path(adaptive_dual_root, subject, args.seed)
         X_train, y_train, X_val, y_val, X_test, y_test = split_session_train_val_test(
             X, y, metadata, val_ratio=args.val_ratio, seed=args.seed
         )

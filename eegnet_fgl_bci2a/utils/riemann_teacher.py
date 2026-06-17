@@ -255,6 +255,7 @@ class PaperRiemannTeacher:
         best_c = best["best_c"]
         self.diagnostics = {
             "riemann_best_c": float(best_c) if best_c is not None else float("nan"),
+            "riemann_selection": self.selection,
             "riemann_selection_mode": self.selection,
             "riemann_selection_folds": int(self.selection_folds),
             "riemann_selection_accuracy": float(best["selection_metrics"]["accuracy"]),

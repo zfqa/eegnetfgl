@@ -296,7 +296,7 @@ def append_or_update_csv(csv_path: str | Path, row: dict[str, Any], key_columns:
             if column not in new_df.columns:
                 new_df[column] = np.nan
         mask = pd.Series(False, index=old_df.index)
-        if all(column in old_df.columns for column in key_columns):
+        if all(column in old_df.columns and column in row for column in key_columns):
             mask = pd.Series(True, index=old_df.index)
             for column in key_columns:
                 mask &= old_df[column].astype(str) == str(row[column])

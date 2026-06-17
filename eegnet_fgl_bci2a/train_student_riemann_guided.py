@@ -694,15 +694,11 @@ def main() -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
 
     tag = (
-        f"{args.dataset}_subject_{args.subject}_{args.model_variant}_window_{args.window:g}_riemwin_{args.riemann_window:g}_seed_{args.seed}"
-        f"_eegkd_{args.eegnet_kd_weight:g}_riekd_{args.kl_weight:g}_geo_{args.geometry_weight:g}_supcon_{args.supcon_weight:g}"
-        f"_teacherweight_{args.teacher_weight_mode}"
-        f"_spatial_{args.spatial_structure_weight:g}_{args.spatial_structure_source}_{args.spatial_structure_mode}_{args.spatial_structure_trust_mode}"
-        f"_geom_{args.geometry_mode}_{args.geometry_trust_mode}_k_{args.graph_k}_gt_{args.graph_temperature:g}"
-        f"_gate_{args.trust_gate_mode}_{args.confidence_mode}_{args.confidence_threshold:g}"
-        f"_riem_{args.riemann_cov_estimator}_{args.riemann_alignment}_{args.riemann_method}"
-        f"_select_{args.riemann_selection}{args.riemann_selection_folds}"
-        f"_cal_{args.teacher_calibration}_raw_shrink_{args.cov_shrinkage:g}"
+        f"{args.dataset}_s{args.subject}_{args.model_variant}_w{args.window:g}_rw{args.riemann_window:g}_s{args.seed}"
+        f"_eeg{args.eegnet_kd_weight:g}_rie{args.kl_weight:g}_geo{args.geometry_weight:g}"
+        f"_sp{args.spatial_structure_weight:g}_{args.spatial_structure_source}"
+        f"_riem_{args.riemann_cov_estimator}_{args.riemann_method}"
+        f"_sel{args.riemann_selection}_cal{args.teacher_calibration}"
     )
     checkpoint_path = save_dir / f"{tag}_best.pth"
 
@@ -1001,7 +997,7 @@ def main() -> None:
                 "val_metrics": strip_arrays(val_metrics),
                 "riemann_best_c": float(riemann_model["best_c"]),
                 "riemann_val_metrics": riemann_model["val_metrics"],
-                "riemann_diagnostics": riemann_teacher.diagnostics,
+                "riemann_diagnostics": riemann_teacher.diagnostics if riemann_teacher is not None else {},
                 "loss_args": {
                     "kl_weight": args.kl_weight,
                     "eegnet_kd_weight": args.eegnet_kd_weight,

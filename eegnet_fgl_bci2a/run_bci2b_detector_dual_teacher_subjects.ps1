@@ -36,7 +36,7 @@ foreach ($subject in $Subjects) {
     )
     $teacher = (
         "results\unified_teachers\bci2b\seed_${Seed}\" +
-        "bci2b_subject_${subject}_compact_teacher_best.pth"
+        "bci2b_subject_${subject}_teacher_best.pth"
     )
     if (-not (Test-Path -LiteralPath $detector)) {
         throw "Detector not found: $detector"

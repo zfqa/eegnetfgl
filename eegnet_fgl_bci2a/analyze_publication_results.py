@@ -68,6 +68,7 @@ def bci2b_deep_rows() -> pd.DataFrame:
         RESULTS / "bci2b_compact_2s_teacher_vs_4s_seed42" / "riemann_guided_results.csv",
     ]
     paths.extend(sorted((RESULTS / "bci2b_paper_multiseed").glob("seed_*/*/riemann_guided_results.csv")))
+    paths.extend(sorted((RESULTS / "bci2b_paper_multiseed_unified").glob("seed_*/*/riemann_guided_results.csv")))
     frame = read_csvs(paths)
     frame = frame[frame.get("dataset", "bci2b").fillna("bci2b").astype(str) == "bci2b"].copy()
     frame["label"] = label_deep_config(frame)

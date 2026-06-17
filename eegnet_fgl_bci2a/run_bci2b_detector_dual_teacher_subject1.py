@@ -35,7 +35,7 @@ DEFAULT_DETECTOR = (
 )
 DEFAULT_TEACHER = (
     "results/unified_teachers/bci2b/seed_42/"
-    "bci2b_subject_1_compact_teacher_best.pth"
+    "bci2b_subject_1_teacher_best.pth"
 )
 
 
@@ -147,24 +147,43 @@ def load_detector(path: Path, n_channels: int, n_samples: int, n_classes: int, d
         inferred_channels = state_dict["features.3.weight"].shape[2]
         if inferred_channels != n_channels:
             n_channels = inferred_channels
-    detector = EEGNetV4(
-        n_channels=n_channels,
-        n_samples=n_samples,
-        n_classes=n_classes,
-        dropout_rate=0.5,
-        F1=8,
-        D=2,
-        F2=16,
-        kernel_length=125,
-        separable_kernel_length=16,
-        pool1=4,
-        pool2=8,
-        batch_norm_momentum=0.01,
-        batch_norm_eps=0.001,
-        depthwise_max_norm=1.0,
-        classifier_max_norm=0.25,
-        dropout_type="dropout",
-    ).to(device)
+    target_features = int(state_dict["classifier.weight"].shape[1])
+
+    def build(candidate_samples: int) -> EEGNetV4:
+        return EEGNetV4(
+            n_channels=n_channels,
+            n_samples=candidate_samples,
+            n_classes=n_classes,
+            dropout_rate=0.5,
+            F1=8,
+            D=2,
+            F2=16,
+            kernel_length=125,
+            separable_kernel_length=16,
+            pool1=4,
+            pool2=8,
+            batch_norm_momentum=0.01,
+            batch_norm_eps=0.001,
+            depthwise_max_norm=1.0,
+            classifier_max_norm=0.25,
+            dropout_type="dropout",
+        )
+
+    detector = build(n_samples)
+    if detector.classifier.in_features != target_features:
+        detector = next(
+            (
+                candidate
+                for candidate_samples in [125, 250, 500, 1000]
+                if (candidate := build(candidate_samples)).classifier.in_features == target_features
+            ),
+            None,
+        )
+        if detector is None:
+            raise ValueError(
+                f"Could not infer detector input samples from classifier width {target_features}: {path}"
+            )
+    detector = detector.to(device)
     detector.load_state_dict(checkpoint["model_state_dict"])
     detector.eval()
     for parameter in detector.parameters():
@@ -217,7 +236,7 @@ def main() -> None:
     detector = load_detector(
         Path(args.detector_path),
         n_channels=X_train.shape[1],
-        n_samples=125,  # Detector was trained with 0.5s window at 250Hz
+        n_samples=int(round(args.detector_win * args.fs)),
         n_classes=n_classes,
         device=device,
     )

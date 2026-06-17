@@ -11,6 +11,12 @@ import pandas as pd
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run all missing global-routing candidates for one seed.")
     parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        choices=["bci2a", "bci2b"],
+        default=["bci2a", "bci2b"],
+    )
     parser.add_argument("--subjects", type=int, nargs="+", default=list(range(1, 10)))
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--epochs", type=int, default=300)
@@ -19,6 +25,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher_root", type=str, default="results/unified_teachers")
     parser.add_argument("--paper2a_root", type=str, default="results/paper_moabb_multiseed_unified")
     parser.add_argument("--paper2b_root", type=str, default="results/bci2b_paper_multiseed_unified")
+    parser.add_argument(
+        "--candidate_source_root",
+        type=str,
+        default="",
+        help="Optional completed routing-candidate root to reuse. Candidates do not depend on teachers.",
+    )
     parser.add_argument("--rerun_existing", action="store_true")
     return parser.parse_args()
 
@@ -47,7 +59,7 @@ def unified_teacher_path(root: Path, dataset: str, subject: int, seed: int) -> P
     if dataset == "bci2a":
         name = f"subject_{subject}_teacher_best.pth"
     else:
-        name = f"bci2b_subject_{subject}_compact_teacher_best.pth"
+        name = f"bci2b_subject_{subject}_teacher_best.pth"
     path = root / dataset / f"seed_{seed}" / name
     if not path.exists():
         raise FileNotFoundError(
@@ -62,79 +74,100 @@ def main() -> None:
     python = sys.executable
     teacher_root = Path(args.teacher_root)
     seed_root = Path(args.output_root) / f"seed_{args.seed}"
-    bci2a_candidates = seed_root / "bci2a_candidates"
+    candidate_seed_root = (
+        Path(args.candidate_source_root) / f"seed_{args.seed}"
+        if args.candidate_source_root
+        else seed_root
+    )
+    bci2a_candidates = candidate_seed_root / "bci2a_candidates"
     bci2a_dual = seed_root / "bci2a_adaptive_dual"
-    bci2b_candidates = seed_root / "bci2b_candidates"
+    bci2b_candidates = candidate_seed_root / "bci2b_candidates"
     bci2b_dual = seed_root / "bci2b_adaptive_dual"
-    for path in [bci2a_candidates, bci2a_dual, bci2b_candidates, bci2b_dual]:
+    for path in [bci2a_dual, bci2b_dual]:
         path.mkdir(parents=True, exist_ok=True)
+    if not args.candidate_source_root:
+        bci2a_candidates.mkdir(parents=True, exist_ok=True)
+        bci2b_candidates.mkdir(parents=True, exist_ok=True)
 
     for subject in args.subjects:
-        bci2a_ce_csv = bci2a_candidates / "routing_ce_results.csv"
-        if args.rerun_existing or not csv_has(bci2a_ce_csv, subject, args.seed):
-            run(
-                [
-                    python,
-                    "run_bci2a_routing_candidates.py",
-                    "--subject",
-                    str(subject),
-                    "--seed",
-                    str(args.seed),
-                    "--epochs_eegnet",
-                    str(args.epochs),
-                    "--patience_eegnet",
-                    str(args.patience),
-                    "--device",
-                    args.device,
-                    "--save_dir",
-                    str(bci2a_candidates),
-                    "--results_csv",
-                    str(bci2a_ce_csv),
-                ]
-            )
-        bci2a_dual_csv = bci2a_dual / "adaptive_dual_results.csv"
-        if args.rerun_existing or not csv_has(
-            bci2a_dual_csv,
-            subject,
-            args.seed,
-            teacher_calibration="temperature",
-            riemann_selection="inner_cv",
-            riemann_selection_folds=5,
-        ):
-            teacher = unified_teacher_path(teacher_root, "bci2a", subject, args.seed)
-            run(
-                [
-                    python,
-                    "run_bci2a_adaptive_dual_teacher.py",
-                    "--subject",
-                    str(subject),
-                    "--seed",
-                    str(args.seed),
-                    "--epochs",
-                    str(args.epochs),
-                    "--patience",
-                    str(args.patience),
-                    "--device",
-                    args.device,
-                    "--save_dir",
-                    str(bci2a_dual),
-                    "--adaptive_results",
-                    str(bci2a_ce_csv),
-                    "--adaptive_root",
-                    str(bci2a_candidates),
-                    "--eegnet_teacher_path",
-                    str(teacher),
-                    "--teacher_calibration",
-                    "temperature",
-                    "--riemann_selection",
-                    "inner_cv",
-                    "--riemann_selection_folds",
-                    "5",
-                ]
-            )
+        if "bci2a" in args.datasets:
+            bci2a_ce_csv = bci2a_candidates / "routing_ce_results.csv"
+            if args.rerun_existing or not csv_has(bci2a_ce_csv, subject, args.seed):
+                if args.candidate_source_root:
+                    raise FileNotFoundError(
+                        f"Reusable BCI2a routing candidate is missing for S{subject}, "
+                        f"seed={args.seed}: {bci2a_ce_csv}"
+                    )
+                run(
+                    [
+                        python,
+                        "run_bci2a_routing_candidates.py",
+                        "--subject",
+                        str(subject),
+                        "--seed",
+                        str(args.seed),
+                        "--epochs_eegnet",
+                        str(args.epochs),
+                        "--patience_eegnet",
+                        str(args.patience),
+                        "--device",
+                        args.device,
+                        "--save_dir",
+                        str(bci2a_candidates),
+                        "--results_csv",
+                        str(bci2a_ce_csv),
+                    ]
+                )
+            bci2a_dual_csv = bci2a_dual / "adaptive_dual_results.csv"
+            if args.rerun_existing or not csv_has(
+                bci2a_dual_csv,
+                subject,
+                args.seed,
+                teacher_calibration="temperature",
+                riemann_selection="inner_cv",
+                riemann_selection_folds=5,
+            ):
+                teacher = unified_teacher_path(teacher_root, "bci2a", subject, args.seed)
+                run(
+                    [
+                        python,
+                        "run_bci2a_adaptive_dual_teacher.py",
+                        "--subject",
+                        str(subject),
+                        "--seed",
+                        str(args.seed),
+                        "--epochs",
+                        str(args.epochs),
+                        "--patience",
+                        str(args.patience),
+                        "--device",
+                        args.device,
+                        "--save_dir",
+                        str(bci2a_dual),
+                        "--adaptive_results",
+                        str(bci2a_ce_csv),
+                        "--adaptive_root",
+                        str(bci2a_candidates),
+                        "--eegnet_teacher_path",
+                        str(teacher),
+                        "--teacher_calibration",
+                        "temperature",
+                        "--riemann_selection",
+                        "inner_cv",
+                        "--riemann_selection_folds",
+                        "5",
+                    ]
+                )
 
+        if "bci2b" not in args.datasets:
+            continue
         bci2b_ce_csv = bci2b_candidates / "routing_ce_results.csv"
         if args.rerun_existing or not csv_has(bci2b_ce_csv, subject, args.seed):
+            if args.candidate_source_root:
+                raise FileNotFoundError(
+                    f"Reusable BCI2b routing candidate is missing for S{subject}, "
+                    f"seed={args.seed}: {bci2b_ce_csv}"
+                )
             run(
                 [
                     python,
@@ -208,10 +241,13 @@ def main() -> None:
                 ]
             )
 
-    for dataset, candidates, dual in [
+    dataset_paths = [
         ("bci2a", bci2a_candidates, bci2a_dual),
         ("bci2b", bci2b_candidates, bci2b_dual),
-    ]:
+    ]
+    for dataset, candidates, dual in dataset_paths:
+        if dataset not in args.datasets:
+            continue
         output_dir = seed_root / f"{dataset}_routing"
         run(
             [
@@ -239,7 +275,7 @@ def main() -> None:
         )
 
     summaries = []
-    for dataset in ["bci2a", "bci2b"]:
+    for dataset in args.datasets:
         summaries.append(pd.read_csv(seed_root / f"{dataset}_routing" / "summary.csv").iloc[0])
     combined = pd.DataFrame(summaries)
     combined["combined_dataset_mean_acc"] = combined["global_mean_acc"].mean()

@@ -106,45 +106,22 @@ def csv_has_result(
 
 
 def bci2a_teacher(root: str | Path, seed: int, subject: int) -> Path:
-    path = (
-        Path(root)
-        / "bci2a"
-        / f"seed_{seed}"
-        / f"subject_{subject}_teacher_best.pth"
-    )
+    path = Path(root) / "bci2a" / f"seed_{seed}" / f"subject_{subject}_teacher_best.pth"
     if not path.exists():
-        raise FileNotFoundError(f"BCI IV-2a teacher checkpoint not found: {path}")
+        raise FileNotFoundError(f"Validated BCI IV-2a teacher checkpoint not found: {path}")
     return path
 
 
 def bci2b_teacher(root: str | Path, seed: int, subject: int) -> Path:
-    unified = (
+    path = (
         Path(root)
         / "bci2b"
         / f"seed_{seed}"
-        / f"bci2b_subject_{subject}_compact_teacher_best.pth"
+        / f"bci2b_subject_{subject}_teacher_best.pth"
     )
-    if unified.exists():
-        return unified
-    search_dirs = [
-        Path("results/unified_teachers/bci2b") / f"seed_{seed}",
-        Path("results/bci2b_paper_multiseed") / f"seed_{seed}" / "eegnetv4_4s_teacher",
-    ]
-    if seed == 42:
-        search_dirs.append(Path("results/bci2b_eegnetv4_4s_teachers_seed42"))
-
-    for d in search_dirs:
-        compact = sorted(d.glob(f"bci2b_subject_{subject}_compact_*_best.pth"))
-        if compact:
-            return compact[0]
-    for d in search_dirs:
-        legacy = sorted(d.glob(f"bci2b_subject_{subject}_eegnetv4_*_best.pth"))
-        if legacy:
-            return legacy[0]
-    raise FileNotFoundError(
-        f"BCI IV-2b teacher checkpoint not found for seed={seed}, subject={subject}."
-        )
-    return candidates[0]
+    if not path.exists():
+        raise FileNotFoundError(f"Validated compact BCI IV-2b teacher checkpoint not found: {path}")
+    return path
 
 
 def run_command(command: list[str], dry_run: bool) -> None:

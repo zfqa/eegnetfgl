@@ -161,7 +161,7 @@ function Invoke-GuidedRun {
 
 foreach ($seed in $Seeds) {
     $seedRoot = Join-Path $root "seed_$seed"
-    $teacherDir = Join-Path $seedRoot "eegnetv4_4s_upper_bound"
+    $teacherDir = Join-Path $seedRoot "compact_4s_upper_bound"
     $studentDir = Join-Path $seedRoot "deep_models"
     New-Item -ItemType Directory -Force -Path $teacherDir, $studentDir | Out-Null
 
@@ -171,7 +171,7 @@ foreach ($seed in $Seeds) {
         Invoke-GuidedRun $subject $seed $teacherDir $searchDirs `
             "Compact 4s teacher/upper bound" "compact" 4.0 0.0 0.0 0.0
 
-        $teacher = Join-Path (Join-Path $TeacherRoot "seed_$seed") "bci2b_subject_${subject}_compact_teacher_best.pth"
+        $teacher = Join-Path (Join-Path $TeacherRoot "seed_$seed") "bci2b_subject_${subject}_teacher_best.pth"
         if (-not (Test-Path -LiteralPath $teacher)) {
             throw "Validated compact teacher not found: $teacher. Run run_unified_teacher_matrix.py first."
         }
@@ -183,7 +183,7 @@ foreach ($seed in $Seeds) {
         Invoke-GuidedRun $subject $seed $studentDir $searchDirs `
             "EEGNetV4 2s CE" "eegnetv4" 2.0 0.0 0.0 0.0
         Invoke-GuidedRun $subject $seed $studentDir $searchDirs `
-            "EEGNetV4 teacher only" "compact" 2.0 0.4 0.0 0.0 $teacher
+            "Compact EEGNet teacher only" "compact" 2.0 0.4 0.0 0.0 $teacher
         Invoke-GuidedRun $subject $seed $studentDir $searchDirs `
             "Riemann teacher only" "compact" 2.0 0.0 0.4 0.0
         Invoke-GuidedRun $subject $seed $studentDir $searchDirs `
