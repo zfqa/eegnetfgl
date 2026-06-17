@@ -209,6 +209,7 @@ def main() -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = save_dir / (
         f"subject_{args.subject}_stable_peak_dual_teacher_"
+        f"aeeg_{args.alpha_eegnet:g}_arie_{args.alpha_riemann:g}_"
         f"spatial_{args.spatial_structure_weight:g}_{args.spatial_structure_source}_"
         f"{args.spatial_structure_mode}_{args.spatial_structure_trust_mode}_best.pth"
     )
@@ -308,51 +309,63 @@ def main() -> None:
         args.spatial_structure_mode,
     )
 
-    print("Loading frozen 4-s EEGNetV4 teacher...", flush=True)
-    eegnet_teacher, teacher_checkpoint = load_frozen_eegnet_teacher(
-        Path(args.eegnet_teacher_path),
-        X_teacher_train.shape[-1],
-        device,
-        expected_channels=X_teacher_train.shape[1],
-        expected_classes=n_classes,
-        expected_subject=args.subject,
-        expected_seed=args.seed,
-        expected_dataset="bci2b",
-        expected_selection_metric="nll",
-        expected_preprocess={
-            "fmin": float(args.fmin),
-            "fmax": float(args.fmax),
-            "tmin": float(args.tmin),
-            "tmax": float(args.tmax),
-            "fs": int(args.fs),
-            "val_ratio": float(args.val_ratio),
-            "protocol": "moabb_standard",
-            "standardization": "train_channel",
-        },
-    )
-    eegnet_train_logits = collect_eegnet_teacher_logits(
-        eegnet_teacher,
-        X_teacher_train,
-        args.batch_size,
-        device,
-    )
-    eegnet_val_logits = collect_eegnet_teacher_logits(
-        eegnet_teacher,
-        X_teacher_val,
-        args.batch_size,
-        device,
-    )
     eegnet_calibration_temperature = 1.0
-    if args.teacher_calibration == "temperature":
-        eegnet_calibration_temperature, _ = fit_temperature_scaling(eegnet_val_logits, y_val)
-        eegnet_train_logits = apply_temperature_scaling(eegnet_train_logits, eegnet_calibration_temperature)
-        eegnet_val_logits = apply_temperature_scaling(eegnet_val_logits, eegnet_calibration_temperature)
-    eegnet_train_probs = logits_to_probabilities(eegnet_train_logits)
-    eegnet_val_probs = logits_to_probabilities(eegnet_val_logits)
-    eegnet_val_metrics = evaluate_metrics(y_val, eegnet_val_probs.argmax(axis=1))
-    del eegnet_teacher
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    teacher_epoch = -1
+    if args.alpha_eegnet > 0:
+        print("Loading frozen 4-s EEGNetV4 teacher...", flush=True)
+        eegnet_teacher, teacher_checkpoint = load_frozen_eegnet_teacher(
+            Path(args.eegnet_teacher_path),
+            X_teacher_train.shape[-1],
+            device,
+            expected_channels=X_teacher_train.shape[1],
+            expected_classes=n_classes,
+            expected_subject=args.subject,
+            expected_seed=args.seed,
+            expected_dataset="bci2b",
+            expected_selection_metric="nll",
+            expected_preprocess={
+                "fmin": float(args.fmin),
+                "fmax": float(args.fmax),
+                "tmin": float(args.tmin),
+                "tmax": float(args.tmax),
+                "fs": int(args.fs),
+                "val_ratio": float(args.val_ratio),
+                "protocol": "moabb_standard",
+                "standardization": "train_channel",
+            },
+        )
+        teacher_epoch = int(teacher_checkpoint["epoch"])
+        eegnet_train_logits = collect_eegnet_teacher_logits(
+            eegnet_teacher,
+            X_teacher_train,
+            args.batch_size,
+            device,
+        )
+        eegnet_val_logits = collect_eegnet_teacher_logits(
+            eegnet_teacher,
+            X_teacher_val,
+            args.batch_size,
+            device,
+        )
+        if args.teacher_calibration == "temperature":
+            eegnet_calibration_temperature, _ = fit_temperature_scaling(eegnet_val_logits, y_val)
+            eegnet_train_logits = apply_temperature_scaling(
+                eegnet_train_logits, eegnet_calibration_temperature
+            )
+            eegnet_val_logits = apply_temperature_scaling(
+                eegnet_val_logits, eegnet_calibration_temperature
+            )
+        eegnet_train_probs = logits_to_probabilities(eegnet_train_logits)
+        eegnet_val_probs = logits_to_probabilities(eegnet_val_logits)
+        eegnet_val_metrics = evaluate_metrics(y_val, eegnet_val_probs.argmax(axis=1))
+        del eegnet_teacher
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    else:
+        print("Skipping EEGNet teacher because alpha_eegnet=0.", flush=True)
+        eegnet_train_probs = np.full((len(y_train), n_classes), 1.0 / n_classes, dtype=np.float32)
+        eegnet_val_probs = np.full((len(y_val), n_classes), 1.0 / n_classes, dtype=np.float32)
+        eegnet_val_metrics = {"accuracy": float("nan")}
 
     train_args = build_training_args(args)
     train_confidence, _ = build_trust_weights(
@@ -479,7 +492,7 @@ def main() -> None:
         "riemann_input_preprocessing": "raw",
         "riemann_selection": args.riemann_selection,
         "riemann_selection_folds": args.riemann_selection_folds,
-        "teacher_epoch": int(teacher_checkpoint["epoch"]),
+        "teacher_epoch": teacher_epoch,
         "best_epoch": int(checkpoint["epoch"]),
         "accuracy": float(test_metrics["accuracy"]),
         "macro_f1": float(test_metrics["macro_f1"]),
@@ -497,6 +510,8 @@ def main() -> None:
             "smooth_k",
             "teacher_calibration",
             "confidence_mode",
+            "alpha_eegnet",
+            "alpha_riemann",
             "riemann_selection",
             "riemann_selection_folds",
             "spatial_structure_weight",
