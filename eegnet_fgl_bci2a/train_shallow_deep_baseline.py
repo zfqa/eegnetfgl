@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from models import ShallowConvNet, DeepConvNet
 from utils.data_loader import (
     EEGDataset,
+    MOABB_BCI2B_STANDARD_PROTOCOL,
     apply_bci2a_protocol_defaults,
     crop_time_window,
     load_bci2a_subject,
@@ -60,7 +61,7 @@ def main() -> None:
         if args.dataset == "bci2a":
             protocol_defaults = apply_bci2a_protocol_defaults(args.protocol)
         else:
-            protocol_defaults = {"fmin": 8.0, "fmax": 32.0, "tmin": 0.0, "tmax": 4.0, "fs": 250}
+            protocol_defaults = MOABB_BCI2B_STANDARD_PROTOCOL
         args.fmin = float(protocol_defaults["fmin"])
         args.fmax = float(protocol_defaults["fmax"])
         args.tmin = float(protocol_defaults["tmin"])
