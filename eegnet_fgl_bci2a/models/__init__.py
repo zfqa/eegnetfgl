@@ -3,6 +3,7 @@ from .diffusion import DDPM1D, UNet1D
 from .fusion import EEGNetRiemannFusion
 from .gcn import RiemannGCN, TangentMLP
 from .mi_active_detector import MIActiveDetector
+from .shallow_deep_convnet import ShallowConvNet, DeepConvNet
 
 __all__ = [
     "EEGNet",
@@ -13,4 +14,6 @@ __all__ = [
     "RiemannGCN",
     "TangentMLP",
     "MIActiveDetector",
+    "ShallowConvNet",
+    "DeepConvNet",
 ]
