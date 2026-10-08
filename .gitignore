@@ -1,0 +1,8 @@
+nature-skills-main/
+eegnet_fgl_bci2a/.codex_sheet/
+eegnet_fgl_bci2a/outputs/
+eegnet_fgl_bci2a/.pytest_cache/
+eegnet_fgl_bci2a/__pycache__/
+eegnet_fgl_bci2a/**/__pycache__/
+eegnet_fgl_bci2a/manuscripts/referenced_chinese/render_check_refs/
+eegnet_fgl_bci2a/manuscripts/**/*.tiff

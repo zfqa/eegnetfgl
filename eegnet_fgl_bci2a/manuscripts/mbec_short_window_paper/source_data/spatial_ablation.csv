@@ -1,0 +1,5 @@
+method,lambda_r_plus_lambda_s,total_aux_weight,accuracy,subject_sd_accuracy,macro_f1,subject_sd_macro_f1,kappa,subject_sd_kappa
+Riemann KD + spatial,0.05 + 0.05,0.1,0.7589,0.142,0.7525,0.1494,0.5177,0.284
+Riemann KD + spatial,0.10 + 0.10,0.2,0.7648,0.1354,0.7617,0.1373,0.5296,0.2709
+Riemann KD only,0.20 + 0.00,0.2,0.7608,0.1373,0.7543,0.1458,0.5216,0.2745
+Spatial only,0.00 + 0.20,0.2,0.7614,0.1421,0.7551,0.1499,0.5229,0.2841

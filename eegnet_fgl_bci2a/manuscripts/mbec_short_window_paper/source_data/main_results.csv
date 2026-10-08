@@ -1,0 +1,11 @@
+dataset,method,window_s,accuracy,seed_sd,macro_f1,kappa,role
+BCI IV-2a,Fixed 2-s CE,2.0,0.5672,0.0093,0.555,0.4229,candidate
+BCI IV-2a,Fixed 2-s dual teacher,2.0,0.5847,0.0125,0.5724,0.4463,candidate
+BCI IV-2a,Validation-controlled routing,2.0,0.5931,0.0114,0.5842,0.4575,primary
+BCI IV-2a,Compact EEGNet CE,4.0,0.5836,,0.5749,0.4448,reference
+BCI IV-2b,Fixed 2-s CE,2.0,0.7634,0.012,0.7567,0.5268,candidate
+BCI IV-2b,Fixed Riemann KD + spatial,2.0,0.766,0.0142,0.7627,0.5319,candidate
+BCI IV-2b,Adaptive CE,2.0,0.7675,0.0031,0.7637,0.5349,candidate
+BCI IV-2b,Adaptive Riemann KD + spatial,2.0,0.7712,0.0152,0.7681,0.5424,primary
+BCI IV-2b,Validation-controlled routing,2.0,0.7701,0.0103,0.7665,0.5402,diagnostic
+BCI IV-2b,Compact EEGNet CE,4.0,0.7806,,0.7763,0.5612,reference
