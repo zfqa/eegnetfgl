@@ -99,6 +99,11 @@ def parse_args() -> argparse.Namespace:
         default=4.0,
         help="Seconds used by the Riemann teacher. Use 4.0 to distill full-window covariance structure into a short-window student.",
     )
+    parser.add_argument(
+        "--skip_riemann_teacher_test",
+        action="store_true",
+        help="Skip diagnostic 4s Riemann teacher evaluation on the held-out test session.",
+    )
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=0.001)
@@ -711,7 +716,10 @@ def main() -> None:
     X_train, X_val, X_test = standardize_by_train(X_train_raw, X_val_raw, X_test_raw)
     X_train_riemann_raw = crop_time_window(X_train_raw, seconds=args.riemann_window, fs=args.fs)
     X_val_riemann_raw = crop_time_window(X_val_raw, seconds=args.riemann_window, fs=args.fs)
-    X_test_riemann_raw = crop_time_window(X_test_raw, seconds=args.riemann_window, fs=args.fs)
+    X_test_riemann_raw = (
+        None if args.skip_riemann_teacher_test
+        else crop_time_window(X_test_raw, seconds=args.riemann_window, fs=args.fs)
+    )
     X_train_teacher = crop_time_window(X_train, seconds=args.riemann_window, fs=args.fs)
     X_val_teacher = crop_time_window(X_val, seconds=args.riemann_window, fs=args.fs)
     X_train = crop_time_window(X_train, seconds=args.window, fs=args.fs)
@@ -1057,7 +1065,7 @@ def main() -> None:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     test_metrics = evaluate(model, test_loader, device)
-    if riemann_teacher is not None:
+    if riemann_teacher is not None and X_test_riemann_raw is not None:
         riemann_test_output = riemann_teacher.predict_output(X_test_riemann_raw)
         riemann_test_metrics = evaluate_metrics(y_test, riemann_test_output.predictions)
     else:
@@ -1070,7 +1078,7 @@ def main() -> None:
         f"Riemann-guided EEGNet test | window={args.window:g}s | acc={test_metrics['accuracy']:.4f} | "
         f"f1={test_metrics['macro_f1']:.4f} | kappa={test_metrics['kappa']:.4f}"
     )
-    if riemann_teacher is not None:
+    if riemann_teacher is not None and X_test_riemann_raw is not None:
         print(
             f"Riemann teacher test | acc={riemann_test_metrics['accuracy']:.4f} | "
             f"f1={riemann_test_metrics['macro_f1']:.4f} | kappa={riemann_test_metrics['kappa']:.4f}"
@@ -1140,6 +1148,7 @@ def main() -> None:
         riemann_test_accuracy=float(riemann_test_metrics["accuracy"]),
         riemann_test_macro_f1=float(riemann_test_metrics["macro_f1"]),
         riemann_test_kappa=float(riemann_test_metrics["kappa"]),
+        riemann_teacher_test_evaluated=bool(riemann_teacher is not None and X_test_riemann_raw is not None),
         confidence_mean=float(train_confidence.mean()),
         confidence_active_ratio=float((train_confidence > 0).mean()),
         trust_gate_val_accuracy=float(trust_diagnostics["trust_gate_val_accuracy"]),
