@@ -82,10 +82,10 @@ Figure 3 and Table 3 place the 2-s methods against reproduced classical and neur
 | --- | --- | ---: | ---: | ---: |
 | BCI IV-2a | ShallowConvNet | 0.5187 +/- 0.0026 | 0.5113 | 0.3582 |
 | BCI IV-2a | DeepConvNet | 0.4863 +/- 0.0131 | 0.4553 | 0.3151 |
-| BCI IV-2a | CSP-LDA | 0.5530 | -- | -- |
+| BCI IV-2a | CSP-LDA | 0.5530 | 0.5270 | 0.4040 |
 | BCI IV-2a | FBCSP-LDA | 0.5638 | 0.5517 | 0.4184 |
-| BCI IV-2a | Riemann TS-LogReg | 0.5694 | -- | -- |
-| BCI IV-2a | EEGNetV4 CE | 0.5809 | -- | -- |
+| BCI IV-2a | Riemann TS-LogReg | 0.5694 | 0.5570 | 0.4259 |
+| BCI IV-2a | EEGNetV4 CE | 0.5809 | 0.5666 | 0.4412 |
 | BCI IV-2a | Validation-controlled routing | 0.5931 +/- 0.0114 | 0.5842 | 0.4575 |
 | BCI IV-2b | ShallowConvNet | 0.7477 +/- 0.0073 | 0.7443 | 0.4954 |
 | BCI IV-2b | DeepConvNet | 0.7487 +/- 0.0118 | 0.7429 | 0.4973 |

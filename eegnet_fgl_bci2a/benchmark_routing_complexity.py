@@ -20,10 +20,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def compact_eegnet(n_channels: int, n_classes: int) -> EEGNet:
+def compact_eegnet(n_channels: int, n_classes: int, n_samples: int = 500) -> EEGNet:
     return EEGNet(
         n_channels=n_channels,
-        n_samples=500,
+        n_samples=n_samples,
         n_classes=n_classes,
         dropout_rate=0.5,
         F1=8,
@@ -107,20 +107,27 @@ def benchmark_dataset(
     repeats: int,
 ) -> list[dict[str, object]]:
     student = compact_eegnet(n_channels, n_classes)
+    four_second_model = compact_eegnet(n_channels, n_classes, n_samples=1000)
     detector_batch = torch.randn(detector_windows, 1, n_channels, detector_samples)
     student_batch = torch.randn(1, 1, n_channels, 500)
+    four_second_batch = torch.randn(1, 1, n_channels, 1000)
 
     student_macs = count_macs(student.eval(), student_batch)
+    four_second_macs = count_macs(four_second_model.eval(), four_second_batch)
     detector_macs_per_window = count_macs(detector.eval(), detector_batch[:1])
     student_params = count_parameters(student)
+    four_second_params = count_parameters(four_second_model)
     detector_params = count_parameters(detector)
 
     student = student.to(device).eval()
+    four_second_model = four_second_model.to(device).eval()
     detector = detector.to(device).eval()
     detector_batch = detector_batch.to(device)
     student_batch = student_batch.to(device)
+    four_second_batch = four_second_batch.to(device)
 
     fixed_latency = benchmark(lambda: student(student_batch), device, warmup, repeats)
+    four_second_latency = benchmark(lambda: four_second_model(four_second_batch), device, warmup, repeats)
 
     def adaptive_forward() -> None:
         detector(detector_batch)
@@ -137,6 +144,16 @@ def benchmark_dataset(
             "parameters_executed": student_params,
             "macs": student_macs,
             "latency_ms_per_trial": fixed_latency,
+        },
+        {
+            "dataset": dataset,
+            "route": "fixed_4s_compact",
+            "device": str(device),
+            "train_time_teachers_used_at_inference": False,
+            "detector_windows": 0,
+            "parameters_executed": four_second_params,
+            "macs": four_second_macs,
+            "latency_ms_per_trial": four_second_latency,
         },
         {
             "dataset": dataset,

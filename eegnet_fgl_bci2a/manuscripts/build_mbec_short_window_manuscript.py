@@ -94,10 +94,10 @@ def write_source_data() -> dict[str, pd.DataFrame]:
         [
             ["BCI IV-2a", "ShallowConvNet", 2.0, 0.5187, 0.0026, 0.5113, 0.3582],
             ["BCI IV-2a", "DeepConvNet", 2.0, 0.4863, 0.0131, 0.4553, 0.3151],
-            ["BCI IV-2a", "CSP-LDA", 2.0, 0.5530, np.nan, np.nan, np.nan],
+            ["BCI IV-2a", "CSP-LDA", 2.0, 0.5530, np.nan, 0.5270, 0.4040],
             ["BCI IV-2a", "FBCSP-LDA", 2.0, 0.5638, np.nan, 0.5517, 0.4184],
-            ["BCI IV-2a", "Riemann TS-LogReg", 2.0, 0.5694, np.nan, np.nan, np.nan],
-            ["BCI IV-2a", "EEGNetV4 CE", 2.0, 0.5809, np.nan, np.nan, np.nan],
+            ["BCI IV-2a", "Riemann TS-LogReg", 2.0, 0.5694, np.nan, 0.5570, 0.4259],
+            ["BCI IV-2a", "EEGNetV4 CE", 2.0, 0.5809, np.nan, 0.5666, 0.4412],
             ["BCI IV-2a", "Validation-controlled routing", 2.0, 0.5931, 0.0114, 0.5842, 0.4575],
             ["BCI IV-2b", "ShallowConvNet", 2.0, 0.7477, 0.0073, 0.7443, 0.4954],
             ["BCI IV-2b", "DeepConvNet", 2.0, 0.7487, 0.0118, 0.7429, 0.4973],
