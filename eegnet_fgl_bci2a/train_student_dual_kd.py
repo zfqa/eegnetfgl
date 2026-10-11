@@ -16,7 +16,7 @@ from utils.data_loader import (
     EEGDataset,
     apply_bci2a_protocol_defaults,
     crop_time_window,
-    load_bci2a_subject,
+    load_bci_subject_preprocessed,
     split_session_train_val_test,
     standardize_by_train,
 )
@@ -145,6 +145,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tmin", type=float, default=0)
     parser.add_argument("--tmax", type=float, default=4)
     parser.add_argument("--fs", type=int, default=250)
+    parser.add_argument(
+        "--preprocessing_mode",
+        choices=["moabb_zero_phase", "causal_mat"],
+        default="moabb_zero_phase",
+    )
+    parser.add_argument("--causal_filter_order", type=int, default=4)
+    parser.add_argument("--data_dir", type=str, default="")
     parser.add_argument("--val_ratio", type=float, default=0.2)
     parser.add_argument("--patience", type=int, default=100)
     parser.add_argument("--log_interval", type=int, default=10)
@@ -212,6 +219,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--synthetic_eegnet_conf_threshold", type=float, default=0.5)
     parser.add_argument("--synthetic_riemann_quantile", type=float, default=0.95)
     parser.add_argument("--rerun_existing", action="store_true")
+    parser.add_argument(
+        "--reset_student_seed_before_fit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reset RNG immediately before student construction for strictly matched ablations.",
+    )
     return parser.parse_args()
 
 
@@ -775,6 +788,7 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
         "seed",
         "protocol",
         "teacher_mode",
+        "teacher_window",
         "teacher_trust_mode",
         "diffusion_multiplier",
         "student_model_variant",
@@ -784,6 +798,8 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
         "teacher_calibration",
         "loss_type",
         "synthetic_ce_weight",
+        "preprocessing_mode",
+        "reset_student_seed_before_fit",
     }
     if uses_riemann_teacher(args.teacher_mode):
         required.update(
@@ -825,6 +841,7 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
         & (df["seed"].astype(int) == int(args.seed))
         & (df["protocol"].astype(str) == args.protocol)
         & (df["teacher_mode"].astype(str) == args.teacher_mode)
+        & np.isclose(df["teacher_window"].astype(float), float(args.teacher_window))
         & (df["teacher_trust_mode"].astype(str) == args.teacher_trust_mode)
         & np.isclose(df["diffusion_multiplier"].astype(float), float(args.diffusion_multiplier))
         & (df["student_model_variant"].astype(str) == args.student_model_variant)
@@ -834,6 +851,8 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
         & (df["teacher_calibration"].astype(str) == args.teacher_calibration)
         & (df["loss_type"].astype(str) == args.loss_type)
         & np.isclose(df["synthetic_ce_weight"].astype(float), float(args.synthetic_ce_weight))
+        & (df["preprocessing_mode"].astype(str) == args.preprocessing_mode)
+        & (df["reset_student_seed_before_fit"].astype(str) == str(bool(args.reset_student_seed_before_fit)))
     )
     if uses_riemann_teacher(args.teacher_mode):
         mask = (
@@ -909,18 +928,24 @@ def main() -> None:
         f"a{args.alpha1:g}_{args.alpha2:g}_t{args.temperature:g}_"
         f"cal_{args.teacher_calibration}_"
         f"rsel_{args.riemann_selection}{args.riemann_selection_folds}_"
+        f"prep_{args.preprocessing_mode}_"
+        f"seedreset{int(args.reset_student_seed_before_fit)}_"
         f"{args.loss_type}_synce{args.synthetic_ce_weight:g}_"
         f"{args.diffusion_task}_mask{args.mask_ratio:g}_lam{args.diffusion_fusion_lambda:g}_"
         f"{args.student_model_variant}"
     )
     checkpoint_path = save_dir / f"{tag}_best.pth"
 
-    X, y, metadata = load_bci2a_subject(
+    X, y, metadata = load_bci_subject_preprocessed(
+        "bci2a",
         args.subject,
+        preprocessing_mode=args.preprocessing_mode,
         fmin=args.fmin,
         fmax=args.fmax,
         tmin=args.tmin,
         tmax=args.tmax,
+        causal_filter_order=args.causal_filter_order,
+        data_dir=args.data_dir or None,
     )
     X_train_raw, y_train, X_val_raw, y_val, X_test_raw, y_test = split_session_train_val_test(
         X, y, metadata, val_ratio=args.val_ratio, seed=args.seed
@@ -1074,7 +1099,8 @@ def main() -> None:
         f"student_shape={X_train_student_aug.shape[1:]}, teacher_shape={X_train_teacher_aug.shape[1:]}, "
         f"teacher_mode={args.teacher_mode}, diffusion_ratio={args.diffusion_ratio:g}, "
         f"diffusion_type={args.diffusion_type}, device={device}, protocol={args.protocol}, "
-        f"band={args.fmin:g}-{args.fmax:g}Hz, t={args.tmin:g}-{args.tmax:g}s",
+        f"band={args.fmin:g}-{args.fmax:g}Hz, t={args.tmin:g}-{args.tmax:g}s, "
+        f"preprocessing={args.preprocessing_mode}",
         flush=True,
     )
     print("Teacher soft labels are produced only for train/val. Test uses only the 2s student.", flush=True)
@@ -1111,6 +1137,11 @@ def main() -> None:
                 "fs": int(args.fs),
                 "val_ratio": float(args.val_ratio),
                 "protocol": args.protocol,
+                "preprocessing_mode": args.preprocessing_mode,
+                "causal_filter_order": (
+                    args.causal_filter_order if args.preprocessing_mode == "causal_mat" else None
+                ),
+                "teacher_window": float(args.teacher_window),
             },
             require_preprocess_metadata=args.require_teacher_preprocess_metadata,
         )
@@ -1237,6 +1268,13 @@ def main() -> None:
         flush=True,
     )
 
+    if args.reset_student_seed_before_fit:
+        set_seed(args.seed)
+        print(
+            f"Reset student RNG to seed={args.seed} after teacher-logit preparation for matched initialization.",
+            flush=True,
+        )
+
     train_loader = DataLoader(
         DualTeacherDataset(
             X_train_student_aug,
@@ -1284,6 +1322,11 @@ def main() -> None:
                 "model_variant": args.student_model_variant,
                 "model_args": student_model_args(args, X_train_student_aug.shape[1], X_train_student_aug.shape[2]),
                 "split_seed": args.seed,
+                "preprocessing_mode": args.preprocessing_mode,
+                "causal_filter_order": (
+                    args.causal_filter_order if args.preprocessing_mode == "causal_mat" else None
+                ),
+                "reset_student_seed_before_fit": bool(args.reset_student_seed_before_fit),
                 "val_metrics": {**strip_arrays(val_metrics), "dual_kd_loss": float(val_kd_loss)},
                 "eegnet_teacher_source": eegnet_teacher_source,
                 "eegnet_teacher_epoch": teacher_checkpoint.get("epoch", np.nan),
@@ -1383,6 +1426,11 @@ def main() -> None:
         fmax=args.fmax,
         tmin=args.tmin,
         tmax=args.tmax,
+        preprocessing_mode=args.preprocessing_mode,
+        causal_filter_order=(
+            args.causal_filter_order if args.preprocessing_mode == "causal_mat" else np.nan
+        ),
+        reset_student_seed_before_fit=bool(args.reset_student_seed_before_fit),
         dropout_rate=args.dropout_rate,
         dropout_type=args.dropout_type,
         F1=args.F1,
@@ -1411,6 +1459,7 @@ def main() -> None:
             "seed",
             "protocol",
             "teacher_mode",
+            "teacher_window",
             "teacher_trust_mode",
             "diffusion_multiplier",
             "student_model_variant",
@@ -1420,6 +1469,8 @@ def main() -> None:
             "teacher_calibration",
             "loss_type",
             "synthetic_ce_weight",
+            "preprocessing_mode",
+            "reset_student_seed_before_fit",
             "diffusion_ratio",
             "diffusion_type",
             "diffusion_task",

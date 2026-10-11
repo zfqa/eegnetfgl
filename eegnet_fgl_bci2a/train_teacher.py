@@ -13,8 +13,7 @@ from utils.data_loader import (
     MOABB_BCI2B_STANDARD_PROTOCOL,
     apply_bci2a_protocol_defaults,
     crop_time_window,
-    load_bci2a_subject,
-    load_bci2b_subject,
+    load_bci_subject_preprocessed,
     split_session_train_val_test,
     standardize_by_train,
 )
@@ -47,7 +46,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fmax", type=float, default=38)
     parser.add_argument("--tmin", type=float, default=0)
     parser.add_argument("--tmax", type=float, default=4)
+    parser.add_argument(
+        "--teacher_window",
+        type=float,
+        default=None,
+        help="Teacher observation length relative to the cue; defaults to tmax-tmin.",
+    )
     parser.add_argument("--fs", type=int, default=250)
+    parser.add_argument(
+        "--preprocessing_mode",
+        choices=["moabb_zero_phase", "causal_mat"],
+        default="moabb_zero_phase",
+    )
+    parser.add_argument("--causal_filter_order", type=int, default=4)
+    parser.add_argument("--data_dir", type=str, default="")
     parser.add_argument("--val_ratio", type=float, default=0.2)
     parser.add_argument("--patience", type=int, default=100)
     parser.add_argument(
@@ -143,11 +155,17 @@ def teacher_model_args(args: argparse.Namespace, n_channels: int, n_samples: int
     }
 
 
-def teacher_checkpoint_name(subject: int, model_variant: str, dataset: str = "bci2a") -> str:
+def teacher_checkpoint_name(
+    subject: int,
+    model_variant: str,
+    dataset: str = "bci2a",
+    teacher_window: float = 4.0,
+) -> str:
     prefix = "" if dataset == "bci2a" else f"{dataset}_"
+    window_tag = "" if np.isclose(teacher_window, 4.0) else f"_{teacher_window:g}s"
     if model_variant == "compact":
-        return f"{prefix}subject_{subject}_teacher_best.pth"
-    return f"{prefix}subject_{subject}_{model_variant}_teacher_best.pth"
+        return f"{prefix}subject_{subject}_teacher{window_tag}_best.pth"
+    return f"{prefix}subject_{subject}_{model_variant}_teacher{window_tag}_best.pth"
 
 
 def main() -> None:
@@ -167,23 +185,36 @@ def main() -> None:
     device = resolve_device(args.device)
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = save_dir / teacher_checkpoint_name(args.subject, args.model_variant, args.dataset)
-
-    loader = load_bci2b_subject if args.dataset == "bci2b" else load_bci2a_subject
-    X, y, metadata = loader(
+    teacher_seconds = (
+        float(args.teacher_window)
+        if args.teacher_window is not None
+        else float(args.tmax - args.tmin)
+    )
+    if not 0 < teacher_seconds <= args.tmax - args.tmin:
+        raise ValueError("teacher_window must be positive and no longer than the loaded epoch.")
+    checkpoint_path = save_dir / teacher_checkpoint_name(
         args.subject,
+        args.model_variant,
+        args.dataset,
+        teacher_seconds,
+    )
+
+    X, y, metadata = load_bci_subject_preprocessed(
+        args.dataset,
+        args.subject,
+        preprocessing_mode=args.preprocessing_mode,
         fmin=args.fmin,
         fmax=args.fmax,
         tmin=args.tmin,
         tmax=args.tmax,
+        causal_filter_order=args.causal_filter_order,
+        data_dir=args.data_dir or None,
     )
     n_classes = int(np.max(y)) + 1
     X_train, y_train, X_val, y_val, X_test, y_test = split_session_train_val_test(
         X, y, metadata, val_ratio=args.val_ratio, seed=args.seed
     )
     X_train, X_val, X_test = standardize_by_train(X_train, X_val, X_test)
-    teacher_seconds = args.tmax - args.tmin
-
     X_train = crop_time_window(X_train, seconds=teacher_seconds, fs=args.fs)
     X_val = crop_time_window(X_val, seconds=teacher_seconds, fs=args.fs)
     X_test = crop_time_window(X_test, seconds=teacher_seconds, fs=args.fs)
@@ -209,6 +240,7 @@ def main() -> None:
         f"train={len(y_train)}, val={len(y_val)}, "
         f"test={len(y_test)}, shape={X_train.shape[1:]}, device={device}, "
         f"protocol={args.protocol}, band={args.fmin:g}-{args.fmax:g}Hz, t={args.tmin:g}-{args.tmax:g}s"
+        f", teacher_window={teacher_seconds:g}s, preprocessing={args.preprocessing_mode}"
     )
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch_ce(model, train_loader, optimizer, device)
@@ -236,6 +268,11 @@ def main() -> None:
                     "val_ratio": args.val_ratio,
                     "protocol": args.protocol,
                     "standardization": "train_channel",
+                    "preprocessing_mode": args.preprocessing_mode,
+                    "causal_filter_order": (
+                        args.causal_filter_order if args.preprocessing_mode == "causal_mat" else None
+                    ),
+                    "teacher_window": teacher_seconds,
                 },
                 "val_metrics": strip_arrays(val_metrics),
                 "selection_metric": args.selection_metric,
@@ -262,10 +299,14 @@ def main() -> None:
     )
 
     row = metric_row(
-        method="EEGNetV4-Teacher-4s" if args.model_variant == "eegnetv4" else "EEGNet-Teacher-4s",
+        method=(
+            f"EEGNetV4-Teacher-{teacher_seconds:g}s"
+            if args.model_variant == "eegnetv4"
+            else f"EEGNet-Teacher-{teacher_seconds:g}s"
+        ),
         dataset=args.dataset,
         subject=args.subject,
-        window=4.0,
+        window=teacher_seconds,
         metrics=test_metrics,
         best_epoch=int(checkpoint["epoch"]),
         seed=args.seed,
@@ -276,6 +317,10 @@ def main() -> None:
         fmax=args.fmax,
         tmin=args.tmin,
         tmax=args.tmax,
+        preprocessing_mode=args.preprocessing_mode,
+        causal_filter_order=(
+            args.causal_filter_order if args.preprocessing_mode == "causal_mat" else np.nan
+        ),
     )
     append_or_update_csv(
         save_dir / "teacher_results.csv",
@@ -289,6 +334,7 @@ def main() -> None:
             "protocol",
             "model_variant",
             "selection_metric",
+            "preprocessing_mode",
         ],
     )
 
