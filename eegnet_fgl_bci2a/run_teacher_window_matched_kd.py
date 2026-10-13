@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -61,14 +63,158 @@ def parse_args() -> argparse.Namespace:
         help="Optional existing root containing tw2.0/seed_X and tw4.0/seed_X teachers.",
     )
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--auto_select_gpu",
+        action="store_true",
+        help="Select and probe an idle physical GPU before every training subprocess.",
+    )
+    parser.add_argument(
+        "--gpu_candidates",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Optional physical GPU indices allowed for automatic selection.",
+    )
+    parser.add_argument("--gpu_min_free_mb", type=int, default=2048)
+    parser.add_argument("--gpu_max_utilization", type=int, default=30)
+    parser.add_argument(
+        "--gpu_poll_seconds",
+        type=float,
+        default=60.0,
+        help="Seconds to wait before checking for an idle GPU again.",
+    )
+    parser.add_argument(
+        "--gpu_wait_timeout_minutes",
+        type=float,
+        default=0.0,
+        help="Maximum idle-GPU wait in minutes; 0 waits indefinitely.",
+    )
     parser.add_argument("--output_dir", type=str, default="results/teacher_window_matched_kd")
     parser.add_argument("--rerun_existing", action="store_true")
     return parser.parse_args()
 
 
-def run(command: list[str]) -> None:
+def parse_nvidia_smi_rows(output: str) -> list[dict[str, int]]:
+    rows = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 4:
+            continue
+        try:
+            index, free_mb, total_mb, utilization = (int(part) for part in parts)
+        except ValueError:
+            continue
+        rows.append(
+            {
+                "index": index,
+                "free_mb": free_mb,
+                "total_mb": total_mb,
+                "utilization": utilization,
+            }
+        )
+    return rows
+
+
+def select_idle_gpu(args: argparse.Namespace) -> dict[str, int]:
+    query = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,memory.free,memory.total,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rows = parse_nvidia_smi_rows(query.stdout)
+    allowed = set(args.gpu_candidates) if args.gpu_candidates else None
+    eligible = [
+        row
+        for row in rows
+        if (allowed is None or row["index"] in allowed)
+        and row["free_mb"] >= args.gpu_min_free_mb
+        and row["utilization"] <= args.gpu_max_utilization
+    ]
+    eligible.sort(key=lambda row: (-row["free_mb"], row["utilization"], row["index"]))
+    if not eligible:
+        raise RuntimeError(
+            "No GPU satisfies automatic selection thresholds: "
+            f"candidates={args.gpu_candidates or 'all'}, "
+            f"min_free_mb={args.gpu_min_free_mb}, "
+            f"max_utilization={args.gpu_max_utilization}. Observed={rows}"
+        )
+
+    probe = (
+        "import torch; "
+        "assert torch.cuda.is_available(), 'CUDA unavailable'; "
+        "x=torch.empty(1, device='cuda'); torch.cuda.synchronize(); del x"
+    )
+    failures = []
+    for row in eligible:
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(row["index"])
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", probe],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            failures.append(f"GPU {row['index']}: probe timeout")
+            continue
+        if result.returncode == 0:
+            return row
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        failures.append(
+            f"GPU {row['index']}: {detail[-1] if detail else f'probe exit {result.returncode}'}"
+        )
+    raise RuntimeError("CUDA probe failed for every eligible GPU: " + " | ".join(failures))
+
+
+def wait_for_idle_gpu(args: argparse.Namespace) -> dict[str, int]:
+    if args.gpu_poll_seconds <= 0:
+        raise ValueError("gpu_poll_seconds must be positive")
+    if args.gpu_wait_timeout_minutes < 0:
+        raise ValueError("gpu_wait_timeout_minutes cannot be negative")
+
+    started = time.monotonic()
+    while True:
+        try:
+            return select_idle_gpu(args)
+        except RuntimeError as error:
+            elapsed = time.monotonic() - started
+            timeout_s = args.gpu_wait_timeout_minutes * 60.0
+            if timeout_s > 0 and elapsed >= timeout_s:
+                raise RuntimeError(
+                    f"Timed out after {elapsed / 60.0:.1f} minutes waiting for an idle GPU."
+                ) from error
+            print(
+                "GPU wait | no eligible CUDA device yet | "
+                f"elapsed={elapsed / 60.0:.1f} min | retry={args.gpu_poll_seconds:g}s | {error}",
+                flush=True,
+            )
+            time.sleep(args.gpu_poll_seconds)
+
+
+def run(command: list[str], args: argparse.Namespace) -> None:
+    env = None
+    if args.auto_select_gpu:
+        selected = wait_for_idle_gpu(args)
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(selected["index"])
+        print(
+            "Auto GPU | "
+            f"physical={selected['index']} | free={selected['free_mb']} MiB/"
+            f"{selected['total_mb']} MiB | utilization={selected['utilization']}%",
+            flush=True,
+        )
     print("\n" + " ".join(command), flush=True)
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, env=env)
 
 
 def teacher_checkpoint(root: Path, subject: int, window: float, dataset: str = "bci2a") -> Path:
@@ -162,7 +308,8 @@ def train_teacher(
             "--epochs", str(args.epochs_teacher),
             "--patience", str(args.patience_teacher),
             "--save_dir", str(save_dir),
-        ]
+        ],
+        args,
     )
     return path
 
@@ -203,7 +350,7 @@ def train_student(
         command.extend(["--eegnet_teacher_path", str(teacher_path), "--require_teacher_preprocess_metadata"])
     if args.rerun_existing:
         command.append("--rerun_existing")
-    run(command)
+    run(command, args)
 
 
 def _paired_test(frame: pd.DataFrame, left: str, right: str) -> dict[str, float | int | str]:
