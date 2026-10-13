@@ -19,6 +19,16 @@ METHODS = {
 }
 
 
+def method_names(selection_metric: str) -> dict[str, str]:
+    if selection_metric == "nll":
+        return METHODS
+    return {
+        "ce": "Matched CE 2s",
+        "teacher_2s": "Accuracy-selected EEGNet KD 2s-to-2s",
+        "teacher_4s": "Accuracy-selected EEGNet KD 4s-to-2s",
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a strictly matched 2s-teacher versus 4s-teacher EEGNet KD experiment."
@@ -38,6 +48,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=0.0001)
     parser.add_argument("--alpha", type=float, default=0.4)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--teacher_selection_metric",
+        choices=["nll", "accuracy"],
+        default="nll",
+        help="Validation metric used to select teacher checkpoints.",
+    )
+    parser.add_argument(
+        "--pretrained_teacher_root",
+        type=str,
+        default="",
+        help="Optional existing root containing tw2.0/seed_X and tw4.0/seed_X teachers.",
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output_dir", type=str, default="results/teacher_window_matched_kd")
     parser.add_argument("--rerun_existing", action="store_true")
@@ -64,6 +86,7 @@ def valid_teacher_checkpoint(
     dataset: str,
     preprocessing_mode: str,
     causal_filter_order: int,
+    selection_metric: str,
 ) -> bool:
     if not path.exists():
         return False
@@ -74,6 +97,7 @@ def valid_teacher_checkpoint(
         int(checkpoint.get("subject", -1)) == subject
         and str(checkpoint.get("dataset", "")) == dataset
         and int(checkpoint.get("split_seed", -1)) == seed
+        and str(checkpoint.get("selection_metric", "")) == selection_metric
         and int(model_args.get("n_samples", -1)) == int(round(window * 250))
         and str(preprocess.get("preprocessing_mode", "")) == preprocessing_mode
         and (
@@ -106,6 +130,7 @@ def train_teacher(
     seed: int,
     window: float,
     save_dir: Path,
+    allow_training: bool = True,
 ) -> Path:
     path = teacher_checkpoint(save_dir, subject, window, args.dataset)
     if not args.rerun_existing and valid_teacher_checkpoint(
@@ -116,9 +141,16 @@ def train_teacher(
         dataset=args.dataset,
         preprocessing_mode=args.preprocessing_mode,
         causal_filter_order=args.causal_filter_order,
+        selection_metric=args.teacher_selection_metric,
     ):
         print(f"Skip verified teacher: {path}", flush=True)
         return path
+    if not allow_training:
+        raise ValueError(
+            f"Missing or incompatible pretrained teacher: {path}. "
+            f"Expected dataset={args.dataset}, subject={subject}, seed={seed}, "
+            f"window={window:g}s, selection={args.teacher_selection_metric}."
+        )
     run(
         [
             sys.executable,
@@ -126,7 +158,7 @@ def train_teacher(
             *common_args(args, subject, seed),
             "--teacher_window", str(window),
             "--model_variant", "compact",
-            "--selection_metric", "nll",
+            "--selection_metric", args.teacher_selection_metric,
             "--epochs", str(args.epochs_teacher),
             "--patience", str(args.patience_teacher),
             "--save_dir", str(save_dir),
@@ -144,6 +176,7 @@ def train_student(
     teacher_window: float,
     save_dir: Path,
 ) -> None:
+    names = method_names(args.teacher_selection_metric)
     teacher_mode = "none" if arm == "ce" else "eegnet"
     alpha = 0.0 if arm == "ce" else args.alpha
     command = [
@@ -153,7 +186,7 @@ def train_student(
         "--student_window", "2.0",
         "--teacher_window", str(teacher_window),
         "--teacher_mode", teacher_mode,
-        "--method_name", METHODS[arm],
+        "--method_name", names[arm],
         "--alpha1", str(alpha),
         "--alpha2", "0.0",
         "--temperature", str(args.temperature),
@@ -196,13 +229,19 @@ def _paired_test(frame: pd.DataFrame, left: str, right: str) -> dict[str, float 
     }
 
 
-def summarize(output_dir: Path, dataset: str, expected_subjects: int) -> None:
+def summarize(
+    output_dir: Path,
+    dataset: str,
+    expected_subjects: int,
+    selection_metric: str,
+) -> None:
+    names = method_names(selection_metric)
     paths = sorted(output_dir.glob("students/*/seed_*/dual_kd_results.csv"))
     if not paths:
         return
     rows = pd.concat([pd.read_csv(path) for path in paths], ignore_index=True)
     rows = rows[
-        rows["method"].isin(METHODS.values())
+        rows["method"].isin(names.values())
         & (rows["dataset"].astype(str) == dataset)
     ].copy()
     rows = rows.drop_duplicates(["dataset", "subject", "seed", "method"], keep="last")
@@ -240,9 +279,9 @@ def summarize(output_dir: Path, dataset: str, expected_subjects: int) -> None:
     )
     tests = pd.DataFrame(
         [
-            _paired_test(subject_means, METHODS["ce"], METHODS["teacher_2s"]),
-            _paired_test(subject_means, METHODS["ce"], METHODS["teacher_4s"]),
-            _paired_test(subject_means, METHODS["teacher_2s"], METHODS["teacher_4s"]),
+            _paired_test(subject_means, names["ce"], names["teacher_2s"]),
+            _paired_test(subject_means, names["ce"], names["teacher_4s"]),
+            _paired_test(subject_means, names["teacher_2s"], names["teacher_4s"]),
         ]
     )
     tests.insert(0, "dataset", dataset)
@@ -257,6 +296,11 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    pretrained_teacher_root = (
+        Path(args.pretrained_teacher_root).resolve()
+        if args.pretrained_teacher_root
+        else None
+    )
     run_config = {
         "dataset": args.dataset,
         "subjects": sorted(set(args.subjects)),
@@ -273,6 +317,8 @@ def main() -> None:
         "weight_decay": args.weight_decay,
         "alpha": args.alpha,
         "temperature": args.temperature,
+        "teacher_selection_metric": args.teacher_selection_metric,
+        "pretrained_teacher_root": str(pretrained_teacher_root or ""),
     }
     config_path = output_dir / "run_config.json"
     if config_path.exists():
@@ -287,11 +333,23 @@ def main() -> None:
     for seed in args.seeds:
         teacher_paths: dict[tuple[float, int], Path] = {}
         for window in (2.0, 4.0):
-            teacher_dir = output_dir / "teachers" / f"tw{window:g}" / f"seed_{seed}"
-            teacher_dir.mkdir(parents=True, exist_ok=True)
+            if pretrained_teacher_root is None:
+                teacher_dir = output_dir / "teachers" / f"tw{window:g}" / f"seed_{seed}"
+                teacher_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                candidates = [
+                    pretrained_teacher_root / f"tw{window:.1f}" / f"seed_{seed}",
+                    pretrained_teacher_root / f"tw{window:g}" / f"seed_{seed}",
+                ]
+                teacher_dir = next((path for path in candidates if path.exists()), candidates[0])
             for subject in args.subjects:
                 teacher_paths[(window, subject)] = train_teacher(
-                    args, subject, seed, window, teacher_dir
+                    args,
+                    subject,
+                    seed,
+                    window,
+                    teacher_dir,
+                    allow_training=pretrained_teacher_root is None,
                 )
 
         for arm, teacher_window in [("ce", 2.0), ("teacher_2s", 2.0), ("teacher_4s", 4.0)]:
@@ -308,7 +366,12 @@ def main() -> None:
                     teacher_window,
                     student_dir,
                 )
-        summarize(output_dir, args.dataset, len(set(args.subjects)))
+        summarize(
+            output_dir,
+            args.dataset,
+            len(set(args.subjects)),
+            args.teacher_selection_metric,
+        )
 
 
 if __name__ == "__main__":

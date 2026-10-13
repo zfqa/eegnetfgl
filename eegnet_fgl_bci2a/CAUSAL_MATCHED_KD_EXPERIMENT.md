@@ -126,3 +126,28 @@ inferential sample size is nine subjects rather than 45 subject-seed runs.
 
 The new causal results form a separate protocol. They must not be numerically
 combined with the earlier MOABB forward-backward-filtered baseline.
+
+## 6. Reuse accuracy-selected causal teachers
+
+If the causal 2 s/4 s CE window experiment has already produced teachers under
+`results/causal_ce_window_bci2a`, reuse those checkpoints without retraining:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 nohup python -u run_teacher_window_matched_kd.py \
+  --dataset bci2a \
+  --subjects 1 2 3 4 5 6 7 8 9 \
+  --seeds 42 2024 3407 7 123 \
+  --preprocessing_mode causal_mat --causal_filter_order 4 --data_dir data \
+  --teacher_selection_metric accuracy \
+  --pretrained_teacher_root results/causal_ce_window_bci2a \
+  --epochs_student 300 --patience_student 100 \
+  --batch_size 32 --lr 0.001 --weight_decay 0.0001 \
+  --alpha 0.4 --temperature 1.0 --device cuda \
+  --output_dir results/teacher_window_matched_kd_causal_accuracy_selected_bci2a \
+  > logs/teacher_window_matched_kd_causal_accuracy_selected_bci2a.out 2>&1 &
+
+echo "PID: $!"
+```
+
+The runner validates dataset, subject, seed, window, preprocessing mode, causal
+filter order and teacher selection metric before accepting an external teacher.
