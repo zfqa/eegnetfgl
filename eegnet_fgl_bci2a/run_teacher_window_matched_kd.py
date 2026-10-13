@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -22,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a strictly matched 2s-teacher versus 4s-teacher EEGNet KD experiment."
     )
+    parser.add_argument("--dataset", choices=["bci2a", "bci2b"], default="bci2a")
     parser.add_argument("--subjects", nargs="+", type=int, default=list(range(1, 10)))
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 2024, 3407, 7, 123])
     parser.add_argument("--preprocessing_mode", choices=["causal_mat", "moabb_zero_phase"], default="causal_mat")
@@ -47,9 +49,10 @@ def run(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
-def teacher_checkpoint(root: Path, subject: int, window: float) -> Path:
+def teacher_checkpoint(root: Path, subject: int, window: float, dataset: str = "bci2a") -> Path:
+    prefix = "" if dataset == "bci2a" else f"{dataset}_"
     suffix = "" if np.isclose(window, 4.0) else f"_{window:g}s"
-    return root / f"subject_{subject}_teacher{suffix}_best.pth"
+    return root / f"{prefix}subject_{subject}_teacher{suffix}_best.pth"
 
 
 def valid_teacher_checkpoint(
@@ -58,7 +61,9 @@ def valid_teacher_checkpoint(
     subject: int,
     seed: int,
     window: float,
+    dataset: str,
     preprocessing_mode: str,
+    causal_filter_order: int,
 ) -> bool:
     if not path.exists():
         return False
@@ -67,15 +72,21 @@ def valid_teacher_checkpoint(
     model_args = checkpoint.get("model_args", {})
     return (
         int(checkpoint.get("subject", -1)) == subject
+        and str(checkpoint.get("dataset", "")) == dataset
         and int(checkpoint.get("split_seed", -1)) == seed
         and int(model_args.get("n_samples", -1)) == int(round(window * 250))
         and str(preprocess.get("preprocessing_mode", "")) == preprocessing_mode
+        and (
+            preprocessing_mode != "causal_mat"
+            or int(preprocess.get("causal_filter_order", -1)) == causal_filter_order
+        )
         and np.isclose(float(preprocess.get("teacher_window", np.nan)), window)
     )
 
 
 def common_args(args: argparse.Namespace, subject: int, seed: int) -> list[str]:
     return [
+        "--dataset", args.dataset,
         "--subject", str(subject),
         "--seed", str(seed),
         "--protocol", "moabb_standard",
@@ -96,13 +107,15 @@ def train_teacher(
     window: float,
     save_dir: Path,
 ) -> Path:
-    path = teacher_checkpoint(save_dir, subject, window)
+    path = teacher_checkpoint(save_dir, subject, window, args.dataset)
     if not args.rerun_existing and valid_teacher_checkpoint(
         path,
         subject=subject,
         seed=seed,
         window=window,
+        dataset=args.dataset,
         preprocessing_mode=args.preprocessing_mode,
+        causal_filter_order=args.causal_filter_order,
     ):
         print(f"Skip verified teacher: {path}", flush=True)
         return path
@@ -111,7 +124,6 @@ def train_teacher(
             sys.executable,
             "train_teacher.py",
             *common_args(args, subject, seed),
-            "--dataset", "bci2a",
             "--teacher_window", str(window),
             "--model_variant", "compact",
             "--selection_metric", "nll",
@@ -184,17 +196,21 @@ def _paired_test(frame: pd.DataFrame, left: str, right: str) -> dict[str, float 
     }
 
 
-def summarize(output_dir: Path) -> None:
+def summarize(output_dir: Path, dataset: str, expected_subjects: int) -> None:
     paths = sorted(output_dir.glob("students/*/seed_*/dual_kd_results.csv"))
     if not paths:
         return
     rows = pd.concat([pd.read_csv(path) for path in paths], ignore_index=True)
-    rows = rows[rows["method"].isin(METHODS.values())].copy()
+    rows = rows[
+        rows["method"].isin(METHODS.values())
+        & (rows["dataset"].astype(str) == dataset)
+    ].copy()
+    rows = rows.drop_duplicates(["dataset", "subject", "seed", "method"], keep="last")
     rows = rows.sort_values(["seed", "subject", "method"])
     rows.to_csv(output_dir / "matched_subject_seed_results.csv", index=False)
 
     seed_summary = (
-        rows.groupby(["seed", "method"], as_index=False)
+        rows.groupby(["dataset", "seed", "method"], as_index=False)
         .agg(
             n_subjects=("subject", "nunique"),
             mean_accuracy=("accuracy", "mean"),
@@ -203,9 +219,9 @@ def summarize(output_dir: Path) -> None:
         )
     )
     seed_summary.to_csv(output_dir / "matched_seed_summary.csv", index=False)
-    complete = seed_summary[seed_summary["n_subjects"] == 9]
+    complete = seed_summary[seed_summary["n_subjects"] == expected_subjects]
     summary = (
-        complete.groupby("method", as_index=False)
+        complete.groupby(["dataset", "method"], as_index=False)
         .agg(
             n_complete_seeds=("seed", "nunique"),
             mean_accuracy=("mean_accuracy", "mean"),
@@ -219,7 +235,7 @@ def summarize(output_dir: Path) -> None:
     summary.to_csv(output_dir / "matched_summary.csv", index=False)
 
     subject_means = (
-        rows.groupby(["subject", "method"], as_index=False)
+        rows.groupby(["dataset", "subject", "method"], as_index=False)
         .agg(accuracy=("accuracy", "mean"))
     )
     tests = pd.DataFrame(
@@ -229,6 +245,7 @@ def summarize(output_dir: Path) -> None:
             _paired_test(subject_means, METHODS["teacher_2s"], METHODS["teacher_4s"]),
         ]
     )
+    tests.insert(0, "dataset", dataset)
     tests.to_csv(output_dir / "matched_paired_tests.csv", index=False)
     print("\nMATCHED SUMMARY", flush=True)
     print(summary.to_string(index=False), flush=True)
@@ -240,6 +257,33 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    run_config = {
+        "dataset": args.dataset,
+        "subjects": sorted(set(args.subjects)),
+        "seeds": sorted(set(args.seeds)),
+        "preprocessing_mode": args.preprocessing_mode,
+        "causal_filter_order": args.causal_filter_order,
+        "data_dir": str(Path(args.data_dir).resolve()),
+        "epochs_teacher": args.epochs_teacher,
+        "epochs_student": args.epochs_student,
+        "patience_teacher": args.patience_teacher,
+        "patience_student": args.patience_student,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "alpha": args.alpha,
+        "temperature": args.temperature,
+    }
+    config_path = output_dir / "run_config.json"
+    if config_path.exists():
+        previous = json.loads(config_path.read_text(encoding="utf-8"))
+        if previous != run_config:
+            raise ValueError(
+                f"Output directory contains a different run configuration: {config_path}. "
+                "Use a new --output_dir to avoid mixing experiments."
+            )
+    else:
+        config_path.write_text(json.dumps(run_config, indent=2), encoding="utf-8")
     for seed in args.seeds:
         teacher_paths: dict[tuple[float, int], Path] = {}
         for window in (2.0, 4.0):
@@ -264,7 +308,7 @@ def main() -> None:
                     teacher_window,
                     student_dir,
                 )
-        summarize(output_dir)
+        summarize(output_dir, args.dataset, len(set(args.subjects)))
 
 
 if __name__ == "__main__":

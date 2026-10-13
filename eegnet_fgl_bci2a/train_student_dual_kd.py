@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 from models import EEGNet, EEGNetV4
 from utils.data_loader import (
     EEGDataset,
+    MOABB_BCI2B_STANDARD_PROTOCOL,
     apply_bci2a_protocol_defaults,
     crop_time_window,
     load_bci_subject_preprocessed,
@@ -53,6 +54,7 @@ class DualTeacherDataset(Dataset):
         eegnet_teacher_logits: np.ndarray | None = None,
         riemann_teacher_logits: np.ndarray | None = None,
         is_synthetic: np.ndarray | None = None,
+        n_classes: int = 4,
     ) -> None:
         if X_student.ndim != 3:
             raise ValueError(f"Expected X_student shape [trials, channels, samples], got {X_student.shape}")
@@ -61,17 +63,28 @@ class DualTeacherDataset(Dataset):
         n_trials = len(y)
         self.X_student = np.asarray(X_student, dtype=np.float32)
         self.y = np.asarray(y, dtype=np.int64)
-        self.eegnet_teacher_logits = self._prepare_logits(eegnet_teacher_logits, n_trials, "eegnet_teacher_logits")
-        self.riemann_teacher_logits = self._prepare_logits(riemann_teacher_logits, n_trials, "riemann_teacher_logits")
+        self.eegnet_teacher_logits = self._prepare_logits(
+            eegnet_teacher_logits, n_trials, n_classes, "eegnet_teacher_logits"
+        )
+        self.riemann_teacher_logits = self._prepare_logits(
+            riemann_teacher_logits, n_trials, n_classes, "riemann_teacher_logits"
+        )
         self.is_synthetic = self._prepare_synthetic_flags(is_synthetic, n_trials)
 
     @staticmethod
-    def _prepare_logits(logits: np.ndarray | None, n_trials: int, name: str) -> np.ndarray:
+    def _prepare_logits(
+        logits: np.ndarray | None,
+        n_trials: int,
+        n_classes: int,
+        name: str,
+    ) -> np.ndarray:
         if logits is None:
-            return np.zeros((n_trials, 4), dtype=np.float32)
+            return np.zeros((n_trials, n_classes), dtype=np.float32)
         logits = np.asarray(logits, dtype=np.float32)
-        if logits.shape != (n_trials, 4):
-            raise ValueError(f"{name} must have shape [{n_trials}, 4], got {logits.shape}")
+        if logits.shape != (n_trials, n_classes):
+            raise ValueError(
+                f"{name} must have shape [{n_trials}, {n_classes}], got {logits.shape}"
+            )
         return logits
 
     @staticmethod
@@ -97,6 +110,7 @@ class DualTeacherDataset(Dataset):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a 2s EEGNet student with diffusion augmentation and dual teachers.")
+    parser.add_argument("--dataset", choices=["bci2a", "bci2b"], default="bci2a")
     parser.add_argument("--subject", type=int, default=1)
     parser.add_argument("--student_window", "--window", dest="student_window", type=float, default=2.0)
     parser.add_argument("--teacher_window", type=float, default=4.0)
@@ -248,8 +262,9 @@ def uses_riemann_teacher(teacher_mode: str) -> bool:
     return teacher_mode in {"riemann", "dual"}
 
 
-def default_eegnet_teacher_path(subject: int) -> Path:
-    return Path("results/teacher") / f"subject_{subject}_teacher_best.pth"
+def default_eegnet_teacher_path(subject: int, dataset: str = "bci2a") -> Path:
+    prefix = "" if dataset == "bci2a" else f"{dataset}_"
+    return Path("results/teacher") / f"{prefix}subject_{subject}_teacher_best.pth"
 
 
 def default_method_name(args: argparse.Namespace) -> str:
@@ -279,7 +294,7 @@ def build_student(args: argparse.Namespace, n_channels: int, n_samples: int) -> 
         return EEGNetV4(
             n_channels=n_channels,
             n_samples=n_samples,
-            n_classes=4,
+            n_classes=args.num_classes,
             dropout_rate=args.dropout_rate,
             F1=args.F1,
             D=args.D,
@@ -293,7 +308,7 @@ def build_student(args: argparse.Namespace, n_channels: int, n_samples: int) -> 
     return EEGNet(
         n_channels=n_channels,
         n_samples=n_samples,
-        n_classes=4,
+        n_classes=args.num_classes,
         dropout_rate=args.dropout_rate,
         F1=args.F1,
         D=args.D,
@@ -306,7 +321,7 @@ def student_model_args(args: argparse.Namespace, n_channels: int, n_samples: int
     common = {
         "n_channels": n_channels,
         "n_samples": n_samples,
-        "n_classes": 4,
+        "n_classes": args.num_classes,
         "dropout_rate": args.dropout_rate,
         "F1": args.F1,
         "D": args.D,
@@ -478,6 +493,7 @@ def fit_simple_riemann_teacher_logits(
     X_val_apply: np.ndarray,
     shrinkage: float,
     c_grid: list[float],
+    n_classes: int = 4,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
     train_covs = covariance_matrices(X_train_real, shrinkage=shrinkage)
     reference = riemannian_mean(train_covs)
@@ -508,8 +524,8 @@ def fit_simple_riemann_teacher_logits(
         ),
     )
 
-    train_probs = _expand_predict_proba(best["model"], train_apply_features)
-    val_probs = _expand_predict_proba(best["model"], val_apply_features)
+    train_probs = _expand_predict_proba(best["model"], train_apply_features, n_classes=n_classes)
+    val_probs = _expand_predict_proba(best["model"], val_apply_features, n_classes=n_classes)
     train_logits = np.log(np.clip(train_probs, 1e-8, 1.0)).astype(np.float32)
     val_logits = np.log(np.clip(val_probs, 1e-8, 1.0)).astype(np.float32)
     diagnostics = {
@@ -537,6 +553,7 @@ def fit_paper_riemann_teacher_logits(
     calibration: str = "temperature",
     selection: str = "inner_cv",
     selection_folds: int = 5,
+    n_classes: int = 4,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     return fit_shared_paper_riemann_teacher_logits(
         X_train_real,
@@ -554,7 +571,7 @@ def fit_paper_riemann_teacher_logits(
         calibration=calibration,
         selection=selection,
         selection_folds=selection_folds,
-        n_classes=4,
+        n_classes=n_classes,
     )
 
 
@@ -783,6 +800,7 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
     df = pd.read_csv(csv_path)
     required = {
         "method",
+        "dataset",
         "subject",
         "window",
         "seed",
@@ -799,7 +817,11 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
         "loss_type",
         "synthetic_ce_weight",
         "preprocessing_mode",
+        "causal_filter_order",
         "reset_student_seed_before_fit",
+        "batch_size",
+        "lr",
+        "weight_decay",
     }
     if uses_riemann_teacher(args.teacher_mode):
         required.update(
@@ -836,6 +858,7 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
         return False
     mask = (
         (df["method"].astype(str) == resolved_method_name(args))
+        & (df["dataset"].astype(str) == args.dataset)
         & (df["subject"].astype(int) == int(args.subject))
         & np.isclose(df["window"].astype(float), float(args.student_window))
         & (df["seed"].astype(int) == int(args.seed))
@@ -852,7 +875,14 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
         & (df["loss_type"].astype(str) == args.loss_type)
         & np.isclose(df["synthetic_ce_weight"].astype(float), float(args.synthetic_ce_weight))
         & (df["preprocessing_mode"].astype(str) == args.preprocessing_mode)
+        & (
+            (args.preprocessing_mode != "causal_mat")
+            | np.isclose(df["causal_filter_order"].astype(float), float(args.causal_filter_order))
+        )
         & (df["reset_student_seed_before_fit"].astype(str) == str(bool(args.reset_student_seed_before_fit)))
+        & (df["batch_size"].astype(int) == int(args.batch_size))
+        & np.isclose(df["lr"].astype(float), float(args.lr))
+        & np.isclose(df["weight_decay"].astype(float), float(args.weight_decay))
     )
     if uses_riemann_teacher(args.teacher_mode):
         mask = (
@@ -889,8 +919,13 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
 def main() -> None:
     args = parse_args()
     normalize_diffusion_args(args)
+    args.num_classes = 4 if args.dataset == "bci2a" else 2
     if args.protocol == "moabb_standard":
-        protocol_defaults = apply_bci2a_protocol_defaults(args.protocol)
+        protocol_defaults = (
+            apply_bci2a_protocol_defaults(args.protocol)
+            if args.dataset == "bci2a"
+            else MOABB_BCI2B_STANDARD_PROTOCOL
+        )
         args.fmin = float(protocol_defaults["fmin"])
         args.fmax = float(protocol_defaults["fmax"])
         args.tmin = float(protocol_defaults["tmin"])
@@ -923,7 +958,7 @@ def main() -> None:
     set_seed(args.seed)
     device = resolve_device(args.device)
     tag = (
-        f"s{args.subject}_sw{args.student_window:g}_tw{args.teacher_window:g}_seed{args.seed}_"
+        f"{args.dataset}_s{args.subject}_sw{args.student_window:g}_tw{args.teacher_window:g}_seed{args.seed}_"
         f"{resolved_method_name(args)}_diff{args.diffusion_multiplier:g}_"
         f"a{args.alpha1:g}_{args.alpha2:g}_t{args.temperature:g}_"
         f"cal_{args.teacher_calibration}_"
@@ -937,7 +972,7 @@ def main() -> None:
     checkpoint_path = save_dir / f"{tag}_best.pth"
 
     X, y, metadata = load_bci_subject_preprocessed(
-        "bci2a",
+        args.dataset,
         args.subject,
         preprocessing_mode=args.preprocessing_mode,
         fmin=args.fmin,
@@ -947,6 +982,13 @@ def main() -> None:
         causal_filter_order=args.causal_filter_order,
         data_dir=args.data_dir or None,
     )
+    observed_classes = np.unique(y)
+    expected_classes = np.arange(args.num_classes)
+    if not np.array_equal(observed_classes, expected_classes):
+        raise ValueError(
+            f"{args.dataset} labels must be {expected_classes.tolist()}, "
+            f"got {observed_classes.tolist()}."
+        )
     X_train_raw, y_train, X_val_raw, y_val, X_test_raw, y_test = split_session_train_val_test(
         X, y, metadata, val_ratio=args.val_ratio, seed=args.seed
     )
@@ -1017,7 +1059,11 @@ def main() -> None:
         )
         if len(y_synth) and args.filter_synthetic_samples:
             pre_filter_count = int(len(y_synth))
-            filter_teacher_path = Path(args.eegnet_teacher_path) if args.eegnet_teacher_path else default_eegnet_teacher_path(args.subject)
+            filter_teacher_path = (
+                Path(args.eegnet_teacher_path)
+                if args.eegnet_teacher_path
+                else default_eegnet_teacher_path(args.subject, args.dataset)
+            )
             print(
                 f"Synthetic filtering enabled | pre_filter={pre_filter_count} | "
                 f"eegnet_conf_threshold={args.synthetic_eegnet_conf_threshold:g} | "
@@ -1034,10 +1080,10 @@ def main() -> None:
                 device,
                 teacher_expectations={
                     "expected_channels": X_train_teacher.shape[1],
-                    "expected_classes": 4,
+                    "expected_classes": args.num_classes,
                     "expected_subject": args.subject,
                     "expected_seed": args.seed,
-                    "expected_dataset": "bci2a",
+                    "expected_dataset": args.dataset,
                 },
             )
             X_synth_teacher, y_synth, riemann_filter_diagnostics = filter_synthetic_by_riemann_covariance(
@@ -1094,7 +1140,7 @@ def main() -> None:
     synthetic_ratio = num_synthetic / max(num_real + num_synthetic, 1)
 
     print(
-        f"Subject {args.subject} {resolved_method_name(args)}: real_train={len(y_train)}, "
+        f"{args.dataset} subject {args.subject} {resolved_method_name(args)}: real_train={len(y_train)}, "
         f"aug_train={len(y_train_aug)}, val={len(y_val)}, test={len(y_test)}, "
         f"student_shape={X_train_student_aug.shape[1:]}, teacher_shape={X_train_teacher_aug.shape[1:]}, "
         f"teacher_mode={args.teacher_mode}, diffusion_ratio={args.diffusion_ratio:g}, "
@@ -1119,16 +1165,20 @@ def main() -> None:
     eegnet_calibration_temperature = 1.0
     eegnet_calibration_diagnostics = {"nll_before": float("nan"), "nll_after": float("nan")}
     if uses_eegnet_teacher(args.teacher_mode):
-        teacher_path = Path(args.eegnet_teacher_path) if args.eegnet_teacher_path else default_eegnet_teacher_path(args.subject)
+        teacher_path = (
+            Path(args.eegnet_teacher_path)
+            if args.eegnet_teacher_path
+            else default_eegnet_teacher_path(args.subject, args.dataset)
+        )
         teacher, teacher_checkpoint = load_frozen_eegnet_teacher(
             teacher_path,
             X_train_teacher.shape[2],
             device,
             expected_channels=X_train_teacher.shape[1],
-            expected_classes=4,
+            expected_classes=args.num_classes,
             expected_subject=args.subject,
             expected_seed=args.seed,
-            expected_dataset="bci2a",
+            expected_dataset=args.dataset,
             expected_preprocess={
                 "fmin": float(args.fmin),
                 "fmax": float(args.fmax),
@@ -1195,7 +1245,8 @@ def main() -> None:
     }
     if uses_riemann_teacher(args.teacher_mode):
         print(
-            f"Fitting 4s {args.riemann_teacher_style} Riemann teacher on real train only; "
+            f"Fitting {args.teacher_window:g}s {args.riemann_teacher_style} Riemann teacher "
+            "on real train only; "
             f"selection={args.riemann_selection}; test is not used.",
             flush=True,
         )
@@ -1216,6 +1267,7 @@ def main() -> None:
                 calibration=args.teacher_calibration,
                 selection=args.riemann_selection,
                 selection_folds=args.riemann_selection_folds,
+                n_classes=args.num_classes,
             )
         else:
             riemann_train_logits, riemann_val_logits, riemann_diagnostics = fit_simple_riemann_teacher_logits(
@@ -1227,6 +1279,7 @@ def main() -> None:
                 X_val_teacher_riemann,
                 shrinkage=args.riemann_cov_shrinkage,
                 c_grid=parse_grid(args.riemann_c_grid),
+                n_classes=args.num_classes,
             )
             riemann_diagnostics.update(
                 {
@@ -1282,13 +1335,20 @@ def main() -> None:
             eegnet_train_logits,
             riemann_train_logits,
             is_synthetic_train_aug,
+            n_classes=args.num_classes,
         ),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=0,
     )
     val_kd_loader = DataLoader(
-        DualTeacherDataset(X_val_student, y_val, eegnet_val_logits, riemann_val_logits),
+        DualTeacherDataset(
+            X_val_student,
+            y_val,
+            eegnet_val_logits,
+            riemann_val_logits,
+            n_classes=args.num_classes,
+        ),
         batch_size=args.batch_size,
         shuffle=False,
     )
@@ -1309,6 +1369,7 @@ def main() -> None:
             checkpoint_path,
             epoch,
             extra={
+                "dataset": args.dataset,
                 "subject": args.subject,
                 "window": args.student_window,
                 "student_window": args.student_window,
@@ -1366,6 +1427,7 @@ def main() -> None:
 
     row = metric_row(
         method=resolved_method_name(args),
+        dataset=args.dataset,
         subject=args.subject,
         window=args.student_window,
         metrics=test_metrics,
@@ -1454,6 +1516,7 @@ def main() -> None:
         row,
         key_columns=[
             "method",
+            "dataset",
             "subject",
             "window",
             "seed",
@@ -1470,7 +1533,11 @@ def main() -> None:
             "loss_type",
             "synthetic_ce_weight",
             "preprocessing_mode",
+            "causal_filter_order",
             "reset_student_seed_before_fit",
+            "batch_size",
+            "lr",
+            "weight_decay",
             "diffusion_ratio",
             "diffusion_type",
             "diffusion_task",
