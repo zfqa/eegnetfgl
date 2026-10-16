@@ -54,6 +54,23 @@ def parse_args() -> argparse.Namespace:
         choices=["nll", "accuracy"],
         default="accuracy",
     )
+    student_rng_group = parser.add_mutually_exclusive_group()
+    student_rng_group.add_argument(
+        "--reset_student_seed_before_fit",
+        dest="reset_student_seed_before_fit",
+        action="store_true",
+        help="Reset RNG after preparing teacher logits so all student arms share matched initialization.",
+    )
+    student_rng_group.add_argument(
+        "--legacy_continuous_student_rng",
+        dest="reset_student_seed_before_fit",
+        action="store_false",
+        help=(
+            "Reproduce the historical paper-matrix behavior: do not reset RNG after "
+            "teacher-logit preparation. Use only for a clearly labelled legacy reproduction."
+        ),
+    )
+    parser.set_defaults(reset_student_seed_before_fit=True)
     parser.add_argument(
         "--pretrained_teacher_root",
         type=str,
@@ -107,7 +124,6 @@ def build_student_command(
         "--loss_type", "raw_dual_kd",
         "--diffusion_ratio", "0",
         "--student_model_variant", "compact",
-        "--reset_student_seed_before_fit",
         "--riemann_teacher_style", "paper",
         "--riemann_paper_method", args.riemann_paper_method,
         "--riemann_cov_estimator", args.riemann_cov_estimator,
@@ -120,6 +136,8 @@ def build_student_command(
         "--patience", str(args.patience_student),
         "--save_dir", str(save_dir),
     ]
+    if args.reset_student_seed_before_fit:
+        command.append("--reset_student_seed_before_fit")
     if teacher_path is not None:
         command.extend(
             [
@@ -216,6 +234,7 @@ def main() -> None:
         "alpha_riemann": args.alpha_riemann,
         "temperature": args.temperature,
         "teacher_selection_metric": args.teacher_selection_metric,
+        "reset_student_seed_before_fit": args.reset_student_seed_before_fit,
         "pretrained_teacher_root": str(pretrained_teacher_root or ""),
         "riemann_paper_method": args.riemann_paper_method,
         "riemann_cov_estimator": args.riemann_cov_estimator,
