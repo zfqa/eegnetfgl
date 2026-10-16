@@ -22,6 +22,16 @@ METHODS = {
 }
 
 
+def method_names(reset_student_seed_before_fit: bool) -> dict[str, str]:
+    if reset_student_seed_before_fit:
+        return METHODS
+    return {
+        "ce": "Legacy-control CE 2s",
+        "teacher_2s": "Legacy dual KD 2s-to-2s",
+        "teacher_4s": "Legacy dual KD 4s-to-2s",
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -32,6 +42,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", choices=["bci2a", "bci2b"], default="bci2a")
     parser.add_argument("--subjects", nargs="+", type=int, default=list(range(1, 10)))
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 2024, 3407, 7, 123])
+    parser.add_argument(
+        "--arms",
+        nargs="+",
+        choices=["ce", "teacher_2s", "teacher_4s"],
+        default=["ce", "teacher_2s", "teacher_4s"],
+        help="Experiment arms to run. Use --arms teacher_2s for the legacy 2s-teacher add-on only.",
+    )
     parser.add_argument(
         "--preprocessing_mode",
         choices=["causal_mat", "moabb_zero_phase"],
@@ -109,6 +126,7 @@ def build_student_command(
     save_dir: Path,
 ) -> list[str]:
     use_teachers = arm != "ce"
+    names = method_names(args.reset_student_seed_before_fit)
     command = [
         sys.executable,
         "train_student_dual_kd.py",
@@ -116,7 +134,7 @@ def build_student_command(
         "--student_window", "2.0",
         "--teacher_window", str(teacher_window),
         "--teacher_mode", "dual" if use_teachers else "none",
-        "--method_name", METHODS[arm],
+        "--method_name", names[arm],
         "--alpha1", str(args.alpha_eegnet if use_teachers else 0.0),
         "--alpha2", str(args.alpha_riemann if use_teachers else 0.0),
         "--temperature", str(args.temperature),
@@ -150,13 +168,19 @@ def build_student_command(
     return command
 
 
-def summarize(output_dir: Path, dataset: str, expected_subjects: int) -> None:
+def summarize(
+    output_dir: Path,
+    dataset: str,
+    expected_subjects: int,
+    reset_student_seed_before_fit: bool,
+) -> None:
+    names = method_names(reset_student_seed_before_fit)
     paths = sorted(output_dir.glob("students/*/seed_*/dual_kd_results.csv"))
     if not paths:
         return
     rows = pd.concat([pd.read_csv(path) for path in paths], ignore_index=True)
     rows = rows[
-        rows["method"].isin(METHODS.values())
+        rows["method"].isin(names.values())
         & (rows["dataset"].astype(str) == dataset)
     ].copy()
     rows = rows.drop_duplicates(["dataset", "subject", "seed", "method"], keep="last")
@@ -192,19 +216,22 @@ def summarize(output_dir: Path, dataset: str, expected_subjects: int) -> None:
         rows.groupby(["dataset", "subject", "method"], as_index=False)
         .agg(accuracy=("accuracy", "mean"))
     )
+    available = set(subject_means["method"])
+    comparisons = [
+        (names["ce"], names["teacher_2s"]),
+        (names["ce"], names["teacher_4s"]),
+        (names["teacher_2s"], names["teacher_4s"]),
+    ]
     tests = pd.DataFrame(
-        [
-            _paired_test(subject_means, METHODS["ce"], METHODS["teacher_2s"]),
-            _paired_test(subject_means, METHODS["ce"], METHODS["teacher_4s"]),
-            _paired_test(subject_means, METHODS["teacher_2s"], METHODS["teacher_4s"]),
-        ]
+        [_paired_test(subject_means, left, right) for left, right in comparisons if {left, right} <= available]
     )
-    tests.insert(0, "dataset", dataset)
+    if not tests.empty:
+        tests.insert(0, "dataset", dataset)
     tests.to_csv(output_dir / "matched_dual_paired_tests.csv", index=False)
     print("\nMATCHED DUAL-TEACHER SUMMARY", flush=True)
     print(summary.to_string(index=False), flush=True)
     print("\nSUBJECT-LEVEL PAIRED TESTS", flush=True)
-    print(tests.to_string(index=False), flush=True)
+    print(tests.to_string(index=False) if not tests.empty else "Not enough arms for paired tests.", flush=True)
 
 
 def main() -> None:
@@ -220,6 +247,7 @@ def main() -> None:
         "dataset": args.dataset,
         "subjects": sorted(set(args.subjects)),
         "seeds": sorted(set(args.seeds)),
+        "arms": args.arms,
         "preprocessing_mode": args.preprocessing_mode,
         "causal_filter_order": args.causal_filter_order,
         "data_dir": str(Path(args.data_dir).resolve()),
@@ -256,7 +284,10 @@ def main() -> None:
 
     for seed in args.seeds:
         teacher_paths: dict[tuple[float, int], Path] = {}
-        for window in (2.0, 4.0):
+        teacher_windows = sorted(
+            {2.0 if arm == "teacher_2s" else 4.0 for arm in args.arms if arm != "ce"}
+        )
+        for window in teacher_windows:
             if pretrained_teacher_root is None:
                 teacher_dir = output_dir / "teachers" / f"tw{window:g}" / f"seed_{seed}"
                 teacher_dir.mkdir(parents=True, exist_ok=True)
@@ -276,11 +307,9 @@ def main() -> None:
                     allow_training=pretrained_teacher_root is None,
                 )
 
-        for arm, teacher_window in (
-            ("ce", 2.0),
-            ("teacher_2s", 2.0),
-            ("teacher_4s", 4.0),
-        ):
+        teacher_window_by_arm = {"ce": 2.0, "teacher_2s": 2.0, "teacher_4s": 4.0}
+        for arm in args.arms:
+            teacher_window = teacher_window_by_arm[arm]
             student_dir = output_dir / "students" / arm / f"seed_{seed}"
             student_dir.mkdir(parents=True, exist_ok=True)
             for subject in args.subjects:
@@ -295,7 +324,12 @@ def main() -> None:
                     student_dir,
                 )
                 run(command, args)
-        summarize(output_dir, args.dataset, len(set(args.subjects)))
+        summarize(
+            output_dir,
+            args.dataset,
+            len(set(args.subjects)),
+            args.reset_student_seed_before_fit,
+        )
 
 
 if __name__ == "__main__":
