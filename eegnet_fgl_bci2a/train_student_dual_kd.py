@@ -11,7 +11,7 @@ from sklearn.linear_model import LogisticRegression
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from models import EEGNet, EEGNetV4
+from models import EEGNet, EEGNetV4, SegmentedEEGNetGRU
 from utils.data_loader import (
     EEGDataset,
     MOABB_BCI2B_STANDARD_PROTOCOL,
@@ -170,7 +170,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=100)
     parser.add_argument("--log_interval", type=int, default=10)
 
-    parser.add_argument("--student_model_variant", type=str, default="compact", choices=["compact", "eegnetv4"])
+    parser.add_argument("--student_model_variant", type=str, default="compact", choices=["compact", "compact_gru", "eegnetv4"])
+    parser.add_argument("--segment_samples", type=int, default=50, help="Non-overlapping samples per GRU segment.")
+    parser.add_argument("--gru_hidden_size", type=int, default=256)
+    parser.add_argument("--gru_encoder_pretrain_epochs", type=int, default=300)
+    parser.add_argument("--gru_belief_pretrain_epochs", type=int, default=300)
     parser.add_argument("--dropout_rate", type=float, default=0.5)
     parser.add_argument("--dropout_type", type=str, default="dropout", choices=["dropout", "spatial"])
     parser.add_argument("--F1", type=int, default=8)
@@ -269,6 +273,8 @@ def default_eegnet_teacher_path(subject: int, dataset: str = "bci2a") -> Path:
 
 def default_method_name(args: argparse.Namespace) -> str:
     base = f"{args.student_window:g}s-EEGNet"
+    if args.student_model_variant == "compact_gru":
+        base += "+GRU"
     suffix = ""
     if args.diffusion_multiplier > 0:
         suffix = f"+Diffusionx{args.diffusion_multiplier:g}"
@@ -290,6 +296,19 @@ def resolved_method_name(args: argparse.Namespace) -> str:
 
 
 def build_student(args: argparse.Namespace, n_channels: int, n_samples: int) -> nn.Module:
+    if args.student_model_variant == "compact_gru":
+        return SegmentedEEGNetGRU(
+            n_channels=n_channels,
+            n_samples=n_samples,
+            n_classes=args.num_classes,
+            segment_samples=args.segment_samples,
+            hidden_size=args.gru_hidden_size,
+            dropout_rate=args.dropout_rate,
+            F1=args.F1,
+            D=args.D,
+            F2=args.F2,
+            kernel_length=args.kernel_length,
+        )
     if args.student_model_variant == "eegnetv4":
         return EEGNetV4(
             n_channels=n_channels,
@@ -330,6 +349,8 @@ def student_model_args(args: argparse.Namespace, n_channels: int, n_samples: int
     }
     if args.student_model_variant == "compact":
         return common
+    if args.student_model_variant == "compact_gru":
+        return {**common, "segment_samples": args.segment_samples, "hidden_size": args.gru_hidden_size}
     return {
         **common,
         "separable_kernel_length": args.separable_kernel_length,
@@ -731,6 +752,8 @@ def train_one_epoch_dual_kd(
     args: argparse.Namespace,
 ) -> dict[str, float]:
     model.train()
+    if isinstance(model, SegmentedEEGNetGRU):
+        model.features.eval()
     totals = {"loss": 0.0, "ce": 0.0, "real_ce": 0.0, "synthetic_ce": 0.0, "eegnet_kd": 0.0, "riemann_kd": 0.0}
     total_samples = 0
     real_samples = 0
@@ -773,6 +796,86 @@ def train_one_epoch_dual_kd(
         }
     )
     return out
+
+
+def pretrain_segmented_gru(
+    model: SegmentedEEGNetGRU,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    args: argparse.Namespace,
+    checkpoint_path: Path,
+) -> None:
+    """Offline encoder and belief pretraining adapted from PVN-LBRL."""
+    encoder_head = nn.Sequential(
+        model.features, nn.Flatten(), nn.Linear(model.feature_dim, args.num_classes)
+    ).to(device)
+    optimizer = torch.optim.AdamW(encoder_head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    stopper = EarlyStopping(patience=args.patience, mode="min")
+    encoder_checkpoint = checkpoint_path.with_name(checkpoint_path.stem + "_encoder_pretrain.pth")
+
+    for epoch in range(1, args.gru_encoder_pretrain_epochs + 1):
+        encoder_head.train()
+        for x, y, *_ in train_loader:
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            logits = encoder_head(model.split_segments(x))
+            loss = F.cross_entropy(logits, y.repeat_interleave(model.n_segments))
+            loss.backward()
+            optimizer.step()
+        encoder_head.eval()
+        val_loss = 0.0
+        val_count = 0
+        with torch.no_grad():
+            for x, y, *_ in val_loader:
+                x, y = x.to(device), y.to(device)
+                logits = encoder_head(model.split_segments(x))
+                labels = y.repeat_interleave(model.n_segments)
+                val_loss += float(F.cross_entropy(logits, labels, reduction="sum").item())
+                val_count += len(labels)
+        improved = stopper.step(val_loss / max(val_count, 1), encoder_head, encoder_checkpoint, epoch)
+        if improved or epoch == 1 or epoch % max(args.log_interval, 1) == 0:
+            print(f"GRU encoder pretrain {epoch:03d}/{args.gru_encoder_pretrain_epochs} | val_slice_ce={val_loss / max(val_count, 1):.4f}", flush=True)
+        if stopper.should_stop:
+            break
+    encoder_head.load_state_dict(torch.load(encoder_checkpoint, map_location=device)["model_state_dict"])
+    for parameter in model.features.parameters():
+        parameter.requires_grad_(False)
+    model.features.eval()
+
+    optimizer = torch.optim.AdamW(
+        (parameter for parameter in model.parameters() if parameter.requires_grad),
+        lr=args.lr, weight_decay=args.weight_decay,
+    )
+    stopper = EarlyStopping(patience=args.patience, mode="min")
+    belief_checkpoint = checkpoint_path.with_name(checkpoint_path.stem + "_belief_pretrain.pth")
+    for epoch in range(1, args.gru_belief_pretrain_epochs + 1):
+        model.train()
+        model.features.eval()
+        for x, y, *_ in train_loader:
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            log_beliefs = model.forward_sequence(x)
+            loss = F.nll_loss(log_beliefs.reshape(-1, args.num_classes), y.repeat_interleave(model.n_segments))
+            loss.backward()
+            optimizer.step()
+        model.eval()
+        val_loss = 0.0
+        val_count = 0
+        with torch.no_grad():
+            for x, y, *_ in val_loader:
+                x, y = x.to(device), y.to(device)
+                log_beliefs = model.forward_sequence(x)
+                labels = y.repeat_interleave(model.n_segments)
+                val_loss += float(F.nll_loss(log_beliefs.reshape(-1, args.num_classes), labels, reduction="sum").item())
+                val_count += len(labels)
+        improved = stopper.step(val_loss / max(val_count, 1), model, belief_checkpoint, epoch)
+        if improved or epoch == 1 or epoch % max(args.log_interval, 1) == 0:
+            print(f"GRU belief pretrain {epoch:03d}/{args.gru_belief_pretrain_epochs} | val_slice_nll={val_loss / max(val_count, 1):.4f}", flush=True)
+        if stopper.should_stop:
+            break
+    model.load_state_dict(torch.load(belief_checkpoint, map_location=device)["model_state_dict"])
+    print("GRU pretraining complete | encoder frozen | fixed WAIT actions | zero rewards", flush=True)
 
 
 @torch.no_grad()
@@ -835,6 +938,8 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
                 "riemann_selection_folds",
             }
         )
+    if args.student_model_variant == "compact_gru":
+        required.update({"segment_samples", "gru_hidden_size", "gru_encoder_pretrain_epochs", "gru_belief_pretrain_epochs"})
     if args.diffusion_multiplier > 0:
         required.update(
             {
@@ -895,6 +1000,11 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
             & (df["riemann_selection"].astype(str) == args.riemann_selection)
             & (df["riemann_selection_folds"].astype(int) == int(args.riemann_selection_folds))
         )
+    if args.student_model_variant == "compact_gru":
+        mask = mask & np.isclose(df["segment_samples"].astype(float), args.segment_samples)
+        mask = mask & np.isclose(df["gru_hidden_size"].astype(float), args.gru_hidden_size)
+        mask = mask & np.isclose(df["gru_encoder_pretrain_epochs"].astype(float), args.gru_encoder_pretrain_epochs)
+        mask = mask & np.isclose(df["gru_belief_pretrain_epochs"].astype(float), args.gru_belief_pretrain_epochs)
     if args.diffusion_multiplier > 0:
         mask = (
             mask
@@ -933,6 +1043,13 @@ def main() -> None:
         args.fs = int(protocol_defaults["fs"])
     if args.teacher_window < args.student_window:
         raise ValueError("teacher_window must be >= student_window so each 2s student trial maps to a 4s teacher trial.")
+    if args.student_model_variant == "compact_gru":
+        if args.segment_samples != 50 or args.gru_hidden_size <= 0:
+            raise ValueError("This ablation uses 50-sample segments and a positive GRU hidden size.")
+        if args.gru_encoder_pretrain_epochs <= 0 or args.gru_belief_pretrain_epochs <= 0:
+            raise ValueError("Both GRU pretraining stages require positive epoch counts.")
+        if args.student_window != 2.0 or args.fs != 250:
+            raise ValueError("The 10-segment GRU ablation requires a 2s window at 250 Hz.")
     if args.diffusion_multiplier < 0:
         raise ValueError("diffusion_ratio must be non-negative.")
     if args.synthetic_ce_weight < 0:
@@ -969,6 +1086,13 @@ def main() -> None:
         f"{args.diffusion_task}_mask{args.mask_ratio:g}_lam{args.diffusion_fusion_lambda:g}_"
         f"{args.student_model_variant}"
     )
+    if args.student_model_variant == "compact_gru":
+        tag = (
+            f"{args.dataset}_s{args.subject}_seed{args.seed}_sw{args.student_window:g}_"
+            f"tw{args.teacher_window:g}_{args.teacher_mode}_a{args.alpha1:g}_{args.alpha2:g}_"
+            f"{args.preprocessing_mode}_seg{args.segment_samples}_h{args.gru_hidden_size}_"
+            f"pre{args.gru_encoder_pretrain_epochs}_{args.gru_belief_pretrain_epochs}"
+        )
     checkpoint_path = save_dir / f"{tag}_best.pth"
 
     X, y, metadata = load_bci_subject_preprocessed(
@@ -1003,6 +1127,8 @@ def main() -> None:
     X_train_student = crop_time_window(X_train_teacher, seconds=args.student_window, fs=args.fs)
     X_val_student = crop_time_window(X_val_teacher, seconds=args.student_window, fs=args.fs)
     X_test_student = crop_time_window(X_test_full, seconds=args.student_window, fs=args.fs)
+    if args.student_model_variant == "compact_gru" and X_train_student.shape[2] != 500:
+        raise ValueError("The 10-segment GRU ablation expects exactly 500 student samples.")
 
     diffusion_diagnostics: dict[str, float] = {
         "synthetic_samples": 0.0,
@@ -1356,6 +1482,14 @@ def main() -> None:
     test_loader = DataLoader(EEGDataset(X_test_student, y_test), batch_size=args.batch_size, shuffle=False)
 
     model = build_student(args, X_train_student_aug.shape[1], X_train_student_aug.shape[2]).to(device)
+    student_parameters = sum(parameter.numel() for parameter in model.parameters())
+    print(
+        f"Student model | variant={args.student_model_variant} | parameters={student_parameters} | "
+        f"segments={getattr(model, 'n_segments', 1)} | segment_samples={args.segment_samples if args.student_model_variant == 'compact_gru' else 'n/a'}",
+        flush=True,
+    )
+    if isinstance(model, SegmentedEEGNetGRU):
+        pretrain_segmented_gru(model, train_loader, val_kd_loader, device, args, checkpoint_path)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     stopper = EarlyStopping(patience=args.patience, mode="max")
 
@@ -1382,6 +1516,9 @@ def main() -> None:
                 "synthetic_ratio": synthetic_ratio,
                 "model_variant": args.student_model_variant,
                 "model_args": student_model_args(args, X_train_student_aug.shape[1], X_train_student_aug.shape[2]),
+                "student_parameters": student_parameters,
+                "gru_encoder_pretrain_epochs": args.gru_encoder_pretrain_epochs if args.student_model_variant == "compact_gru" else None,
+                "gru_belief_pretrain_epochs": args.gru_belief_pretrain_epochs if args.student_model_variant == "compact_gru" else None,
                 "split_seed": args.seed,
                 "preprocessing_mode": args.preprocessing_mode,
                 "causal_filter_order": (
@@ -1484,6 +1621,12 @@ def main() -> None:
         synthetic_after_riemann_filter=int(diffusion_diagnostics.get("synthetic_after_riemann_filter", diffusion_diagnostics.get("synthetic_samples", 0.0))),
         synthetic_samples=int(diffusion_diagnostics.get("synthetic_samples", 0.0)),
         student_model_variant=args.student_model_variant,
+        student_parameters=student_parameters,
+        segment_samples=(args.segment_samples if args.student_model_variant == "compact_gru" else np.nan),
+        gru_hidden_size=(args.gru_hidden_size if args.student_model_variant == "compact_gru" else np.nan),
+        gru_encoder_pretrain_epochs=(args.gru_encoder_pretrain_epochs if args.student_model_variant == "compact_gru" else np.nan),
+        gru_belief_pretrain_epochs=(args.gru_belief_pretrain_epochs if args.student_model_variant == "compact_gru" else np.nan),
+        n_segments=getattr(model, "n_segments", 1),
         fmin=args.fmin,
         fmax=args.fmax,
         tmin=args.tmin,
@@ -1526,6 +1669,10 @@ def main() -> None:
             "teacher_trust_mode",
             "diffusion_multiplier",
             "student_model_variant",
+            "segment_samples",
+            "gru_hidden_size",
+            "gru_encoder_pretrain_epochs",
+            "gru_belief_pretrain_epochs",
             "alpha1",
             "alpha2",
             "temperature",
