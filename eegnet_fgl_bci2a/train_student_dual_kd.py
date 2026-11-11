@@ -11,7 +11,7 @@ from sklearn.linear_model import LogisticRegression
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from models import EEGNet, EEGNetV4, SegmentedEEGNetGRU
+from models import EDGCNStudent, EEGNet, EEGNetV4, SegmentedEEGNetGRU
 from utils.data_loader import (
     EEGDataset,
     MOABB_BCI2B_STANDARD_PROTOCOL,
@@ -170,7 +170,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=100)
     parser.add_argument("--log_interval", type=int, default=10)
 
-    parser.add_argument("--student_model_variant", type=str, default="compact", choices=["compact", "compact_gru", "eegnetv4"])
+    parser.add_argument("--student_model_variant", type=str, default="compact", choices=["compact", "compact_gru", "eegnetv4", "edgcn"])
+    parser.add_argument("--edgcn_embedding_dim", type=int, default=16)
+    parser.add_argument("--edgcn_hidden_dim", type=int, default=16)
+    parser.add_argument("--edgcn_cheb_order", type=int, default=3)
+    parser.add_argument("--edgcn_plv_threshold", type=float, default=0.5)
+    parser.add_argument("--edgcn_orth_weight", type=float, default=0.01)
     parser.add_argument("--segment_samples", type=int, default=50, help="Non-overlapping samples per GRU segment.")
     parser.add_argument("--gru_hidden_size", type=int, default=256)
     parser.add_argument("--gru_encoder_pretrain_epochs", type=int, default=300)
@@ -275,6 +280,8 @@ def default_method_name(args: argparse.Namespace) -> str:
     base = f"{args.student_window:g}s-EEGNet"
     if args.student_model_variant == "compact_gru":
         base += "+GRU"
+    elif args.student_model_variant == "edgcn":
+        base = f"{args.student_window:g}s-EDGCN"
     suffix = ""
     if args.diffusion_multiplier > 0:
         suffix = f"+Diffusionx{args.diffusion_multiplier:g}"
@@ -296,6 +303,19 @@ def resolved_method_name(args: argparse.Namespace) -> str:
 
 
 def build_student(args: argparse.Namespace, n_channels: int, n_samples: int) -> nn.Module:
+    if args.student_model_variant == "edgcn":
+        return EDGCNStudent(
+            n_channels=n_channels,
+            n_samples=n_samples,
+            n_classes=args.num_classes,
+            sfreq=args.fs,
+            embedding_dim=args.edgcn_embedding_dim,
+            hidden_dim=args.edgcn_hidden_dim,
+            cheb_order=args.edgcn_cheb_order,
+            plv_threshold=args.edgcn_plv_threshold,
+            dropout_rate=args.dropout_rate,
+            orth_weight=args.edgcn_orth_weight,
+        )
     if args.student_model_variant == "compact_gru":
         return SegmentedEEGNetGRU(
             n_channels=n_channels,
@@ -337,6 +357,19 @@ def build_student(args: argparse.Namespace, n_channels: int, n_samples: int) -> 
 
 
 def student_model_args(args: argparse.Namespace, n_channels: int, n_samples: int) -> dict[str, Any]:
+    if args.student_model_variant == "edgcn":
+        return {
+            "n_channels": n_channels,
+            "n_samples": n_samples,
+            "n_classes": args.num_classes,
+            "sfreq": args.fs,
+            "embedding_dim": args.edgcn_embedding_dim,
+            "hidden_dim": args.edgcn_hidden_dim,
+            "cheb_order": args.edgcn_cheb_order,
+            "plv_threshold": args.edgcn_plv_threshold,
+            "dropout_rate": args.dropout_rate,
+            "orth_weight": args.edgcn_orth_weight,
+        }
     common = {
         "n_channels": n_channels,
         "n_samples": n_samples,
@@ -754,7 +787,7 @@ def train_one_epoch_dual_kd(
     model.train()
     if isinstance(model, SegmentedEEGNetGRU):
         model.features.eval()
-    totals = {"loss": 0.0, "ce": 0.0, "real_ce": 0.0, "synthetic_ce": 0.0, "eegnet_kd": 0.0, "riemann_kd": 0.0}
+    totals = {"loss": 0.0, "ce": 0.0, "real_ce": 0.0, "synthetic_ce": 0.0, "eegnet_kd": 0.0, "riemann_kd": 0.0, "orth": 0.0}
     total_samples = 0
     real_samples = 0
     synthetic_samples = 0
@@ -774,6 +807,8 @@ def train_one_epoch_dual_kd(
         optimizer.zero_grad(set_to_none=True)
         student_logits = model(x)
         loss, parts = compute_supervision_loss(student_logits, y, eegnet_logits, riemann_logits, is_synthetic, args)
+        orth = model.orthogonality_loss() if isinstance(model, EDGCNStudent) else loss.new_zeros(())
+        loss = loss + orth
         loss.backward()
         optimizer.step()
         batch_size = x.size(0)
@@ -783,6 +818,7 @@ def train_one_epoch_dual_kd(
         totals["synthetic_ce"] += float(parts["synthetic_ce"].item()) * batch_size
         totals["eegnet_kd"] += float(parts["eegnet_kd"].item()) * batch_size
         totals["riemann_kd"] += float(parts["riemann_kd"].item()) * batch_size
+        totals["orth"] += float(orth.item()) * batch_size
         total_samples += batch_size
         real_samples += batch_real
         synthetic_samples += batch_synthetic
@@ -890,6 +926,8 @@ def evaluate_dual_kd_loss(model: nn.Module, dataloader: DataLoader, device: torc
         riemann_logits = riemann_logits.to(device)
         is_synthetic = is_synthetic.to(device)
         loss, _ = compute_supervision_loss(model(x), y, eegnet_logits, riemann_logits, is_synthetic, args)
+        if isinstance(model, EDGCNStudent):
+            loss = loss + model.orthogonality_loss()
         total_loss += float(loss.item()) * x.size(0)
         total_samples += x.size(0)
     return total_loss / max(total_samples, 1)
@@ -940,6 +978,8 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
         )
     if args.student_model_variant == "compact_gru":
         required.update({"segment_samples", "gru_hidden_size", "gru_encoder_pretrain_epochs", "gru_belief_pretrain_epochs"})
+    if args.student_model_variant == "edgcn":
+        required.update({"edgcn_embedding_dim", "edgcn_hidden_dim", "edgcn_cheb_order", "edgcn_plv_threshold", "edgcn_orth_weight"})
     if args.diffusion_multiplier > 0:
         required.update(
             {
@@ -1005,6 +1045,9 @@ def row_exists(csv_path: Path, args: argparse.Namespace) -> bool:
         mask = mask & np.isclose(df["gru_hidden_size"].astype(float), args.gru_hidden_size)
         mask = mask & np.isclose(df["gru_encoder_pretrain_epochs"].astype(float), args.gru_encoder_pretrain_epochs)
         mask = mask & np.isclose(df["gru_belief_pretrain_epochs"].astype(float), args.gru_belief_pretrain_epochs)
+    if args.student_model_variant == "edgcn":
+        for column in ("edgcn_embedding_dim", "edgcn_hidden_dim", "edgcn_cheb_order", "edgcn_plv_threshold", "edgcn_orth_weight"):
+            mask = mask & np.isclose(df[column].astype(float), float(getattr(args, column)))
     if args.diffusion_multiplier > 0:
         mask = (
             mask
@@ -1050,6 +1093,13 @@ def main() -> None:
             raise ValueError("Both GRU pretraining stages require positive epoch counts.")
         if args.student_window != 2.0 or args.fs != 250:
             raise ValueError("The 10-segment GRU ablation requires a 2s window at 250 Hz.")
+    if args.student_model_variant == "edgcn":
+        if args.student_window != 2.0 or args.fs != 250:
+            raise ValueError("EDGCN student requires a 2s window at 250 Hz.")
+        if min(args.edgcn_embedding_dim, args.edgcn_hidden_dim, args.edgcn_cheb_order) <= 0:
+            raise ValueError("EDGCN dimensions and Chebyshev order must be positive.")
+        if not 0 <= args.edgcn_plv_threshold <= 1 or args.edgcn_orth_weight <= 0:
+            raise ValueError("EDGCN PLV threshold must be in [0, 1] and orth weight positive.")
     if args.diffusion_multiplier < 0:
         raise ValueError("diffusion_ratio must be non-negative.")
     if args.synthetic_ce_weight < 0:
@@ -1127,8 +1177,8 @@ def main() -> None:
     X_train_student = crop_time_window(X_train_teacher, seconds=args.student_window, fs=args.fs)
     X_val_student = crop_time_window(X_val_teacher, seconds=args.student_window, fs=args.fs)
     X_test_student = crop_time_window(X_test_full, seconds=args.student_window, fs=args.fs)
-    if args.student_model_variant == "compact_gru" and X_train_student.shape[2] != 500:
-        raise ValueError("The 10-segment GRU ablation expects exactly 500 student samples.")
+    if args.student_model_variant in {"compact_gru", "edgcn"} and X_train_student.shape[2] != 500:
+        raise ValueError("The selected student requires exactly 500 samples.")
 
     diffusion_diagnostics: dict[str, float] = {
         "synthetic_samples": 0.0,
@@ -1517,6 +1567,7 @@ def main() -> None:
                 "model_variant": args.student_model_variant,
                 "model_args": student_model_args(args, X_train_student_aug.shape[1], X_train_student_aug.shape[2]),
                 "student_parameters": student_parameters,
+                "edgcn_orth_weight": args.edgcn_orth_weight if args.student_model_variant == "edgcn" else None,
                 "gru_encoder_pretrain_epochs": args.gru_encoder_pretrain_epochs if args.student_model_variant == "compact_gru" else None,
                 "gru_belief_pretrain_epochs": args.gru_belief_pretrain_epochs if args.student_model_variant == "compact_gru" else None,
                 "split_seed": args.seed,
@@ -1542,7 +1593,7 @@ def main() -> None:
                 f"Epoch {epoch:03d}/{args.epochs} | loss={train_losses['loss']:.4f} | "
                 f"ce={train_losses['ce']:.4f} | syn_ce={train_losses['synthetic_ce']:.4f} | "
                 f"eeg_kd={train_losses['eegnet_kd']:.4f} | "
-                f"rie_kd={train_losses['riemann_kd']:.4f} | val_loss={val_kd_loss:.4f} | "
+                f"rie_kd={train_losses['riemann_kd']:.4f} | orth={train_losses['orth']:.4f} | val_loss={val_kd_loss:.4f} | "
                 f"batch_real/syn={train_losses['first_batch_real']:.0f}/{train_losses['first_batch_synthetic']:.0f} | "
                 f"val_acc={val_metrics['accuracy']:.4f} | val_f1={val_metrics['macro_f1']:.4f} | "
                 f"val_kappa={val_metrics['kappa']:.4f} {mark}",
@@ -1622,6 +1673,11 @@ def main() -> None:
         synthetic_samples=int(diffusion_diagnostics.get("synthetic_samples", 0.0)),
         student_model_variant=args.student_model_variant,
         student_parameters=student_parameters,
+        edgcn_embedding_dim=(args.edgcn_embedding_dim if args.student_model_variant == "edgcn" else np.nan),
+        edgcn_hidden_dim=(args.edgcn_hidden_dim if args.student_model_variant == "edgcn" else np.nan),
+        edgcn_cheb_order=(args.edgcn_cheb_order if args.student_model_variant == "edgcn" else np.nan),
+        edgcn_plv_threshold=(args.edgcn_plv_threshold if args.student_model_variant == "edgcn" else np.nan),
+        edgcn_orth_weight=(args.edgcn_orth_weight if args.student_model_variant == "edgcn" else np.nan),
         segment_samples=(args.segment_samples if args.student_model_variant == "compact_gru" else np.nan),
         gru_hidden_size=(args.gru_hidden_size if args.student_model_variant == "compact_gru" else np.nan),
         gru_encoder_pretrain_epochs=(args.gru_encoder_pretrain_epochs if args.student_model_variant == "compact_gru" else np.nan),
@@ -1669,6 +1725,11 @@ def main() -> None:
             "teacher_trust_mode",
             "diffusion_multiplier",
             "student_model_variant",
+            "edgcn_embedding_dim",
+            "edgcn_hidden_dim",
+            "edgcn_cheb_order",
+            "edgcn_plv_threshold",
+            "edgcn_orth_weight",
             "segment_samples",
             "gru_hidden_size",
             "gru_encoder_pretrain_epochs",

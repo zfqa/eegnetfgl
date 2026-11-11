@@ -1,5 +1,6 @@
 from .eegnet import EEGNet, EEGNetV4
 from .eegnet_gru import SegmentedEEGNetGRU
+from .edgcn import EDGCNStudent
 from .diffusion import DDPM1D, UNet1D
 from .fusion import EEGNetRiemannFusion
 from .gcn import RiemannGCN, TangentMLP
@@ -10,6 +11,7 @@ __all__ = [
     "EEGNet",
     "EEGNetV4",
     "SegmentedEEGNetGRU",
+    "EDGCNStudent",
     "DDPM1D",
     "UNet1D",
     "EEGNetRiemannFusion",
