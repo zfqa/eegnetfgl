@@ -1,15 +1,11 @@
-"""Offline pretraining and single-process R2D2-style PVN-LBRL reproduction.
-
-The publication specifies distributed actors and replay but not enough code to
-recover its exact synchronization and replay schedule. This module reproduces
-the stated learning objectives with eight epsilon policies in one process.
-"""
+"""Offline pretraining and actor/replay/learner training for PVN-LBRL."""
 
 from __future__ import annotations
 
 import copy
 import math
 import random
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -17,6 +13,7 @@ import torch
 from sklearn.metrics import accuracy_score, cohen_kappa_score, f1_score
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, TensorDataset
 
 from models.pvn_lbrl import PVNLBRL
@@ -32,38 +29,91 @@ class Episode:
 
 class PrioritizedEpisodeReplay:
     def __init__(self, capacity: int = 1_000_000, alpha: float = 0.9) -> None:
+        if capacity < 1:
+            raise ValueError("Replay capacity must be positive")
         self.capacity = capacity
         self.alpha = alpha
-        self.episodes: list[Episode] = []
-        self.priorities: list[float] = []
+        self.episodes: dict[int, Episode] = {}
+        self.priorities: dict[int, float] = {}
         self.next_index = 0
+        self.oldest = 0
+        self.transition_count = 0
+        self.leaf = 1 << (capacity - 1).bit_length()
+        self.tree = np.zeros(2 * self.leaf, dtype=np.float64)
+        self.max_priority = 1.0
 
     def __len__(self) -> int:
         return len(self.episodes)
 
     def add(self, episode: Episode) -> None:
-        priority = max(self.priorities, default=1.0)
-        if len(self.episodes) < self.capacity:
-            self.episodes.append(episode)
-            self.priorities.append(priority)
-        else:
-            self.episodes[self.next_index] = episode
-            self.priorities[self.next_index] = priority
-            self.next_index = (self.next_index + 1) % self.capacity
+        size = len(episode.actions)
+        if not 0 < size <= self.capacity:
+            raise ValueError("Episode must fit in transition replay")
+        # Evict complete episodes so the recurrent history always starts at reset.
+        while self.transition_count + size > self.capacity:
+            self.transition_count -= len(self.episodes.pop(self.oldest).actions)
+            del self.priorities[self.oldest]
+            self._set_weight(self.oldest, 0.0)
+            self.oldest = (self.oldest + 1) % self.capacity
+        priority = self.max_priority
+        index = self.next_index
+        self.next_index = (index + 1) % self.capacity
+        self.episodes[index] = episode
+        self.priorities[index] = priority
+        self.transition_count += size
+        self._set_weight(index, priority)
+
+    def _set_weight(self, index: int, priority: float) -> None:
+        node = self.leaf + index
+        self.tree[node] = priority ** self.alpha
+        while node > 1:
+            node //= 2
+            self.tree[node] = self.tree[2 * node] + self.tree[2 * node + 1]
 
     def sample(self, batch_size: int, beta: float = 0.6) -> tuple[list[int], list[Episode], np.ndarray]:
-        if not self.episodes:
+        if not len(self):
             raise ValueError("Replay is empty")
-        probabilities = np.asarray(self.priorities, dtype=np.float64) ** self.alpha
-        probabilities /= probabilities.sum()
-        indices = np.random.choice(len(self.episodes), size=batch_size, replace=True, p=probabilities)
-        weights = (len(self.episodes) * probabilities[indices]) ** -beta
+        total = self.tree[1]
+        draws = np.random.uniform(0.0, total, size=batch_size)
+        nodes = np.ones(batch_size, dtype=np.int64)
+        while nodes[0] < self.leaf:
+            nodes *= 2
+            left = self.tree[nodes]
+            right = draws >= left
+            draws -= np.where(right, left, 0.0)
+            nodes += right
+        indices = nodes - self.leaf
+        weights = (len(self) * self.tree[nodes] / total) ** -beta
         weights /= weights.max()
         return indices.tolist(), [self.episodes[i] for i in indices], weights.astype(np.float32)
 
     def update_priorities(self, indices: list[int], td_errors: list[float]) -> None:
         for index, error in zip(indices, td_errors):
-            self.priorities[index] = max(1e-5, float(abs(error)))
+            priority = max(1e-5, float(abs(error)))
+            self.priorities[index] = priority
+            self.max_priority = max(self.max_priority, priority)
+            self._set_weight(index, priority)
+
+
+class SliceReplay:
+    """Uniform slice-label replay, retaining the prefix needed by the GRU."""
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self.entries: list[tuple[Episode, int]] = []
+        self.next_index = 0
+
+    def add(self, episode: Episode) -> None:
+        for length in range(1, len(episode.actions) + 1):
+            entry = (episode, length)
+            if len(self.entries) < self.capacity:
+                self.entries.append(entry)
+            else:
+                self.entries[self.next_index] = entry
+                self.next_index = (self.next_index + 1) % self.capacity
+
+    def sample(self, batch_size: int) -> list[tuple[Episode, int]]:
+        return random.choices(self.entries, k=batch_size)
 
 
 def itr_bits_per_minute(accuracy: float, classes: int, seconds: float) -> float:
@@ -112,12 +162,10 @@ def pretrain_encoder(
     model: PVNLBRL, X: torch.Tensor, y: torch.Tensor,
     X_val: torch.Tensor, y_val: torch.Tensor, epochs: int = 300,
     batch_size: int = 32, lr: float = 1e-3,
-) -> float:
+) -> float | None:
     """Whole-trial PVN pretraining, before training on incoming slices."""
     device = next(model.parameters()).device
     optimizer = torch.optim.AdamW(model.encoder.parameters(), lr=lr)
-    best = -1.0
-    best_state = None
     for _ in range(epochs):
         model.encoder.train()
         for x_batch, y_batch in _loader(X, y, batch_size, True):
@@ -125,63 +173,62 @@ def pretrain_encoder(
             loss = F.nll_loss(model.encoder(x_batch.to(device)), y_batch.to(device))
             loss.backward()
             optimizer.step()
-        model.encoder.eval()
+    model.encoder.eval()
+    model.encoder.requires_grad_(False)
+    if len(y_val):
         with torch.no_grad():
             prediction = torch.cat([
-                model.encoder(x_batch.to(device)).argmax(-1).cpu()
+                model.encoder.predict_vote(x_batch.to(device)).cpu()
                 for x_batch, _ in _loader(X_val, y_val, batch_size, False)
             ])
-        accuracy = float((prediction == y_val).float().mean())
-        if accuracy > best:
-            best, best_state = accuracy, copy.deepcopy(model.encoder.state_dict())
-    if best_state is not None:
-        model.encoder.load_state_dict(best_state)
-    model.encoder.requires_grad_(False)
-    model.encoder.eval()
-    return best
+        return float((prediction == y_val).float().mean())
+    return None
+
+
+def uniform_rollout_mask(actions: torch.Tensor) -> torch.Tensor:
+    """The HALT slice is observed; no slice after it belongs to the episode."""
+    first = torch.ones_like(actions[:, :1], dtype=torch.bool)
+    return torch.cat((first, (actions[:, :-1] == PVNLBRL.WAIT).cumprod(1).bool()), dim=1)
 
 
 def pretrain_belief(
     model: PVNLBRL, X: torch.Tensor, y: torch.Tensor,
     X_val: torch.Tensor, y_val: torch.Tensor, epochs: int = 300,
     batch_size: int = 32, lr: float = 1e-3,
-) -> float:
+) -> float | None:
     """Frozen PVN; NLL at every observed slice (paper Eq. 7-8)."""
     device = next(model.parameters()).device
     parameters = list(model.project.parameters()) + list(model.gru.parameters())
     parameters += list(model.belief_linear.parameters()) + list(model.belief_conv.parameters())
     optimizer = torch.optim.AdamW(parameters, lr=lr)
     encoded_train = encode_trials(model, X, batch_size)
-    encoded_val = encode_trials(model, X_val, batch_size)
-    best = -1.0
-    best_state = None
     for _ in range(epochs):
         model.train()
         model.encoder.eval()
         for encoded_batch, y_batch in _loader(encoded_train, y, batch_size, True):
             optimizer.zero_grad()
-            beliefs, _ = model.forward_encoded_sequence(encoded_batch.to(device))
+            encoded_batch = encoded_batch.to(device)
+            actions = torch.randint(2, encoded_batch.shape[:2], device=device)
+            observed = uniform_rollout_mask(actions)
+            labels = y_batch.to(device)[:, None].expand_as(actions)
+            # All observed non-initial slices have WAIT/0 as previous feedback.
+            beliefs, _ = model.forward_encoded_sequence(encoded_batch)
             loss = F.nll_loss(
-                beliefs.clamp_min(1e-8).log().flatten(0, 1),
-                y_batch.to(device).repeat_interleave(beliefs.shape[1]),
+                beliefs[observed].clamp_min(1e-8).log(), labels[observed],
             )
             loss.backward()
             nn.utils.clip_grad_norm_(parameters, 10.0)
             optimizer.step()
-        model.eval()
+    model.eval()
+    if len(y_val):
+        encoded_val = encode_trials(model, X_val, batch_size)
         with torch.no_grad():
             predicted = torch.cat([
                 model.forward_encoded_sequence(encoded_batch.to(device))[0][:, -1].argmax(-1).cpu()
                 for encoded_batch, _ in _loader(encoded_val, y_val, batch_size, False)
             ])
-        accuracy = float((predicted == y_val).float().mean())
-        if accuracy > best:
-            best = accuracy
-            best_state = copy.deepcopy(model.state_dict())
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    model.encoder.eval()
-    return best
+        return float((predicted == y_val).float().mean())
+    return None
 
 
 @torch.no_grad()
@@ -208,8 +255,6 @@ def collect_episode(
         observed_encoded.append(encoded_slice.squeeze(0).cpu())
         hidden, belief, q = model.step_encoded(encoded_slice, hidden, prev_action, prev_reward)
         action = random.randrange(2) if random.random() < epsilon else int(q.argmax(-1).item())
-        if index == steps - 1:
-            action = model.HALT
         reward = float(1 if int(belief.argmax(-1).item()) == label else -1) if action == model.HALT else 0.0
         action_history.append(action)
         reward_history.append(reward)
@@ -223,12 +268,53 @@ def collect_episode(
     )
 
 
-def _episode_inputs(episode: Episode, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    count = len(episode.actions)
-    previous_actions = torch.tensor([0] + episode.actions[:-1], device=device).unsqueeze(0)
-    previous_rewards = torch.tensor([0.0] + episode.rewards[:-1], device=device).unsqueeze(0)
-    assert episode.actions[-1] == PVNLBRL.HALT and len(episode.encoded) == count
-    return episode.encoded.unsqueeze(0).to(device), previous_actions, previous_rewards
+def _replay_batch(
+    entries: list[tuple[Episode, int]], device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    encoded, actions, rewards = [], [], []
+    for episode, length in entries:
+        encoded.append(episode.encoded[:length])
+        actions.append(torch.tensor(episode.actions[:length]))
+        rewards.append(torch.tensor(episode.rewards[:length]))
+    lengths = torch.tensor([length for _, length in entries], device=device)
+    return (
+        pad_sequence(encoded, batch_first=True).to(device),
+        pad_sequence(actions, batch_first=True).to(device),
+        pad_sequence(rewards, batch_first=True).to(device),
+        lengths,
+        torch.tensor([episode.label for episode, _ in entries], device=device),
+    )
+
+
+def _previous(values: torch.Tensor) -> torch.Tensor:
+    return F.pad(values[:, :-1], (1, 0))
+
+
+def q_rescale(x: torch.Tensor) -> torch.Tensor:
+    return x.sign() * ((x.abs() + 1).sqrt() - 1) + 1e-3 * x
+
+
+def q_unscale(x: torch.Tensor) -> torch.Tensor:
+    eps = 1e-3
+    # Rationalized inverse avoids cancellation when |x| is small.
+    u = 2 * (x.abs() + 1 + eps) / ((1 + 4 * eps * (x.abs() + 1 + eps)).sqrt() + 1)
+    return x.sign() * (u.square() - 1)
+
+
+def r2d2_targets(
+    rewards: torch.Tensor, lengths: torch.Tensor, bootstrap_q: torch.Tensor,
+    gamma: float, n_step: int = 5,
+) -> torch.Tensor:
+    time = torch.arange(rewards.shape[1], device=rewards.device)
+    discounted = torch.zeros_like(rewards)
+    for offset in range(n_step):
+        future = (time + offset).clamp(max=rewards.shape[1] - 1)
+        valid = time + offset < lengths[:, None]
+        discounted += gamma ** offset * rewards[:, future].masked_fill(~valid, 0)
+    future = (time + n_step).clamp(max=rewards.shape[1] - 1)
+    valid = time + n_step < lengths[:, None]
+    discounted += gamma ** n_step * q_unscale(bootstrap_q[:, future]).masked_fill(~valid, 0)
+    return q_rescale(discounted)
 
 
 def q_update(
@@ -237,53 +323,84 @@ def q_update(
 ) -> float:
     indices, episodes, weights = replay.sample(batch_size)
     device = next(model.parameters()).device
-    losses = []
-    priorities = []
-    for episode, weight in zip(episodes, weights):
-        encoded, actions, rewards = _episode_inputs(episode, device)
-        with torch.no_grad():
-            latents = model.latent_sequence(encoded, actions, rewards)
-            target_latents = target.latent_sequence(encoded, actions, rewards)
-            target_q = target.q_network(target_latents)
-            online_q = model.q_network(latents)
-            targets = torch.tensor(episode.rewards, device=device)
-            for step in range(len(episode.actions) - 1):
-                if episode.actions[step] == model.WAIT:
-                    next_action = int(online_q[0, step + 1].argmax().item())
-                    targets[step] += gamma * target_q[0, step + 1, next_action]
-        q_values = model.q_network(latents.detach())
-        selected = q_values[0, torch.arange(len(episode.actions), device=device),
-                            torch.tensor(episode.actions, device=device)]
-        error = selected - targets
-        losses.append(F.smooth_l1_loss(selected, targets) * float(weight))
-        priorities.append(float(error.detach().abs().max()))
+    encoded, actions, rewards, lengths, _ = _replay_batch(
+        [(episode, len(episode.actions)) for episode in episodes], device,
+    )
+    previous_actions, previous_rewards = _previous(actions), _previous(rewards)
+    with torch.no_grad():
+        latents = model.latent_sequence(encoded, previous_actions, previous_rewards)
+        target_latents = target.latent_sequence(encoded, previous_actions, previous_rewards)
+    q_values = model.q_network(latents)
+    with torch.no_grad():
+        greedy = q_values.argmax(-1, keepdim=True)
+        bootstrap = target.q_network(target_latents).gather(-1, greedy).squeeze(-1)
+        targets = r2d2_targets(rewards, lengths, bootstrap, gamma)
+    selected = q_values.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+    valid = torch.arange(actions.shape[1], device=device) < lengths[:, None]
+    abs_td = (selected.detach() - targets).abs().masked_fill(~valid, 0)
+    priorities = 0.9 * abs_td.amax(1) + 0.1 * abs_td.sum(1) / lengths
+    per_sequence = ((selected - targets).square() * valid).sum(1) / lengths
     optimizer.zero_grad()
-    loss = torch.stack(losses).mean()
+    loss = (per_sequence * torch.as_tensor(weights, device=device)).mean()
     loss.backward()
     nn.utils.clip_grad_norm_(model.q_network.parameters(), 10.0)
     optimizer.step()
-    replay.update_priorities(indices, priorities)
+    replay.update_priorities(indices, priorities.tolist())
     return float(loss.item())
 
 
 def belief_update(
-    model: PVNLBRL, replay: PrioritizedEpisodeReplay,
+    model: PVNLBRL, replay: SliceReplay,
     optimizer: torch.optim.Optimizer, batch_size: int = 16,
 ) -> float:
-    _, episodes, _ = replay.sample(batch_size)
     device = next(model.parameters()).device
-    losses = []
-    for episode in episodes:
-        encoded, actions, rewards = _episode_inputs(episode, device)
-        beliefs, _ = model.forward_encoded_sequence(encoded, actions, rewards)
-        log_beliefs = beliefs[0].clamp_min(1e-8).log()
-        labels = torch.full((log_beliefs.shape[0],), episode.label, device=device, dtype=torch.long)
-        losses.append(F.nll_loss(log_beliefs, labels))
+    encoded, actions, rewards, lengths, labels = _replay_batch(replay.sample(batch_size), device)
+    beliefs, _ = model.forward_encoded_sequence(encoded, _previous(actions), _previous(rewards))
+    log_beliefs = beliefs[torch.arange(len(lengths), device=device), lengths - 1].clamp_min(1e-8).log()
     optimizer.zero_grad()
-    loss = torch.stack(losses).mean()
+    loss = F.nll_loss(log_beliefs, labels)
     loss.backward()
     optimizer.step()
     return float(loss.item())
+
+
+def paper_actor_epsilon(actor: int) -> float:
+    """Section 4.2 uses a one-indexed actor i and epsilon_i = 0.4 ** (7 + i)."""
+    return 0.4 ** (8 + actor)
+
+
+@torch.no_grad()
+def _collect_actor_round(
+    actor_model: PVNLBRL, encoded: torch.Tensor, labels: torch.Tensor,
+    count: int, actors: int, seed: int,
+) -> list[Episode]:
+    rng = torch.Generator().manual_seed(seed)
+    indices = torch.randint(len(labels), (count,), generator=rng)
+    trials = encoded[indices]
+    y = labels[indices]
+    epsilons = torch.tensor([paper_actor_epsilon(i % actors) for i in range(count)])
+    steps = trials.shape[1]
+    actions = torch.empty((count, steps), dtype=torch.long)
+    rewards = torch.empty((count, steps))
+    lengths = torch.full((count,), steps, dtype=torch.long)
+    active = torch.arange(count)
+    hidden = None
+    for step in range(steps):
+        previous = trials.new_full((len(active),), PVNLBRL.WAIT if step else PVNLBRL.HALT)
+        hidden, belief, q_values = actor_model.step_encoded(trials[active, step], hidden, previous)
+        explore = torch.rand(len(active), generator=rng) < epsilons[active]
+        action = torch.where(explore, torch.randint(2, (len(active),), generator=rng), q_values.argmax(-1))
+        halt = action == PVNLBRL.HALT
+        actions[active, step] = action
+        rewards[active, step] = torch.where(halt, 2.0 * (belief.argmax(-1) == y[active]).float() - 1.0, 0.0)
+        lengths[active[halt]] = step + 1
+        active, hidden = active[~halt], hidden[~halt]
+        if len(active) == 0:
+            break
+    return [
+        Episode(encoded[int(index), :length], int(label), action[:length].tolist(), reward[:length].tolist())
+        for index, label, length, action, reward in zip(indices, y, lengths.tolist(), actions, rewards)
+    ]
 
 
 def train_policy(
@@ -291,11 +408,15 @@ def train_policy(
     X_val: torch.Tensor, y_val: torch.Tensor,
     steps: int = 50_000, actors: int = 8, gamma: float = 0.1,
     replay_capacity: int = 1_000_000, batch_size: int = 16,
-    belief_every: int = 25, target_every: int = 500,
+    belief_updates: int = 25, belief_epochs: int = 20,
+    actor_sync_every: int = 64, target_every: int = 500,
     validate_every: int = 500, lr: float = 1e-4,
 ) -> dict[str, float]:
-    if not 0 <= gamma < 1 or actors < 1:
-        raise ValueError("gamma must be in [0,1) and actors must be positive")
+    if not 0 <= gamma < 1 or min(actors, steps, batch_size, actor_sync_every,
+                                target_every, validate_every, replay_capacity, len(y)) < 1:
+        raise ValueError("Invalid gamma, empty training data, or non-positive schedule")
+    if not 0 <= belief_updates <= steps or belief_epochs < 1:
+        raise ValueError("Belief rounds must be between 0 and steps, with at least one epoch")
     model.encoder.requires_grad_(False)
     model.encoder.eval()
     target = copy.deepcopy(model).eval()
@@ -305,27 +426,42 @@ def train_policy(
     belief_parameters += list(model.belief_linear.parameters()) + list(model.belief_conv.parameters())
     belief_optimizer = torch.optim.AdamW(belief_parameters, lr=lr)
     replay = PrioritizedEpisodeReplay(replay_capacity)
-    best_score = -float("inf")
-    best_state = None
-    device = next(model.parameters()).device
-    for step in range(steps):
-        actor = step % actors
-        epsilon = 0.4 ** (1 + 7 * actor / max(actors - 1, 1))
-        index = random.randrange(len(y))
-        replay.add(collect_episode(model, X[index], int(y[index]), epsilon, encoded_train[index]))
-        if len(replay) >= min(batch_size, 8):
-            q_update(model, target, replay, q_optimizer, gamma, batch_size)
-            if (step + 1) % belief_every == 0:
-                belief_update(model, replay, belief_optimizer, batch_size)
-            if (step + 1) % target_every == 0:
-                target.load_state_dict(model.state_dict())
-        if (step + 1) % validate_every == 0 or step == steps - 1:
-            metrics = evaluate(model, X_val, y_val)
-            score = metrics["itr_bits_min"]
-            if score > best_score:
-                best_score = score
-                best_state = copy.deepcopy(model.state_dict())
-            print(f"RL step {step + 1}/{steps} replay={len(replay)} val={metrics}", flush=True)
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    return evaluate(model, X_val, y_val)
+    slices = SliceReplay(replay_capacity)
+    labels = y.cpu()
+    rounds = {(i * steps) // belief_updates for i in range(1, belief_updates + 1)}
+    completed_rounds = 0
+    print(f"Actor epsilon: {[paper_actor_epsilon(i) for i in range(actors)]}", flush=True)
+
+    def submit(executor: ThreadPoolExecutor, remaining: int):
+        snapshot = copy.deepcopy(model).cpu().eval()
+        count = max(actors, min(remaining, actor_sync_every))
+        return executor.submit(_collect_actor_round, snapshot, encoded_train, labels,
+                               count, actors, random.randrange(2**32))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = submit(executor, steps)
+        for start in range(0, steps, actor_sync_every):
+            episodes = future.result()
+            end = min(start + actor_sync_every, steps)
+            if end < steps:
+                future = submit(executor, steps - end)
+            for episode in episodes:
+                replay.add(episode)
+                slices.add(episode)
+            for step in range(start + 1, end + 1):
+                q_update(model, target, replay, q_optimizer, gamma, batch_size)
+                if step in rounds:
+                    # The article does not define an online epoch size.
+                    batches = math.ceil(min(len(slices.entries), len(y) * encoded_train.shape[1]) / batch_size)
+                    for _ in range(belief_epochs * batches):
+                        belief_update(model, slices, belief_optimizer, batch_size)
+                    completed_rounds += 1
+                    print(f"Belief learner round {completed_rounds}/{belief_updates} | "
+                          f"epochs={belief_epochs} batches_per_epoch={batches}", flush=True)
+                if step % target_every == 0:
+                    target.load_state_dict(model.state_dict())
+                if step % validate_every == 0 or step == steps:
+                    diagnostics = f" val={evaluate(model, X_val, y_val)}" if len(y_val) else ""
+                    print(f"Q updates {step}/{steps} replay={len(replay)} "
+                          f"slice_replay={len(slices.entries)}{diagnostics}", flush=True)
+    return evaluate(model, X_val, y_val) if len(y_val) else {}

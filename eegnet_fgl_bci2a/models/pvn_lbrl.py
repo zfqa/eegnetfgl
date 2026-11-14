@@ -27,12 +27,14 @@ class PointVotingNetwork(nn.Module):
             raise ValueError("kernel_size must be odd and at least 3 for SAME padding")
         self.classes = classes
         self.spatial = nn.Conv2d(1, spatial_filters, (channels, 1), bias=True)
-        self.temporal = nn.Conv1d(
-            spatial_filters, temporal_filters, kernel_size,
-            padding=kernel_size // 2, bias=True,
+        self.temporal = nn.Conv2d(
+            1, temporal_filters, (1, kernel_size),
+            padding=(0, kernel_size // 2), bias=True,
         )
-        self.norm1 = ChannelLayerNorm(temporal_filters)
-        self.increase = nn.Conv1d(temporal_filters, 2 * temporal_filters, 1)
+        self.norm1 = ChannelLayerNorm(spatial_filters * temporal_filters)
+        self.increase = nn.Conv2d(
+            temporal_filters, 2 * temporal_filters, (spatial_filters, 1),
+        )
         self.norm2 = ChannelLayerNorm(2 * temporal_filters)
         self.classifier = nn.Conv1d(2 * temporal_filters, classes, 1)
         self.initialize_fir()
@@ -46,7 +48,7 @@ class PointVotingNetwork(nn.Module):
         import numpy as np
         from scipy.signal import firwin
 
-        length = self.temporal.kernel_size[0]
+        length = self.temporal.kernel_size[-1]
         bands = np.linspace(1.0, 48.0, self.temporal.out_channels + 1)
         with torch.no_grad():
             for out_channel in range(self.temporal.out_channels):
@@ -64,14 +66,18 @@ class PointVotingNetwork(nn.Module):
             x = x.unsqueeze(1)
         if x.ndim != 4 or x.shape[1] != 1:
             raise ValueError("PVN expects [batch, channels, time] or [batch, 1, channels, time]")
-        z = self.spatial(x).squeeze(2)
-        z = self.norm1(self.temporal(z))
-        z = self.norm2(self.increase(z))
+        z = self.temporal(self.spatial(x).transpose(1, 2))
+        z = self.norm1(z.flatten(1, 2)).reshape_as(z)
+        z = self.norm2(self.increase(z).squeeze(2))
         return self.classifier(z)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Differentiable temporal voting: mean of per-sample class probabilities.
+        # The paper does not specify a differentiable surrogate for its hard vote.
         return self.forward_logits(x).softmax(dim=1).mean(dim=-1).clamp_min(1e-8).log()
+
+    def predict_vote(self, x: torch.Tensor) -> torch.Tensor:
+        point_classes = self.forward_logits(x).argmax(dim=1)
+        return torch.nn.functional.one_hot(point_classes, self.classes).sum(1).argmax(-1)
 
 
 class DuelingQNetwork(nn.Module):
@@ -158,14 +164,24 @@ class PVNLBRL(nn.Module):
         self, encoded: torch.Tensor, previous_actions: torch.Tensor | None = None,
         previous_rewards: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if encoded.ndim != 3:
+            raise ValueError("encoded observations must have shape [batch, slices, features]")
+        history_shape = encoded.shape[:2]
+        if previous_actions is None:
+            # Every prefix after the first exists only because the policy waited.
+            previous_actions = encoded.new_full(history_shape, self.WAIT)
+            previous_actions[:, 0] = self.HALT
+        if previous_rewards is None:
+            previous_rewards = encoded.new_zeros(history_shape)
+        if previous_actions.shape != history_shape or previous_rewards.shape != history_shape:
+            raise ValueError("action/reward history must match batch and slice dimensions")
         hidden = None
         beliefs = []
         q_values = []
         for index in range(encoded.shape[1]):
-            prior_action = None if previous_actions is None else previous_actions[:, index]
-            prior_reward = None if previous_rewards is None else previous_rewards[:, index]
             hidden, belief, q = self.step_encoded(
-                encoded[:, index], hidden, prior_action, prior_reward,
+                encoded[:, index], hidden,
+                previous_actions[:, index], previous_rewards[:, index],
             )
             beliefs.append(belief)
             q_values.append(q)

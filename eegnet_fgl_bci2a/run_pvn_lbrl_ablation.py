@@ -19,6 +19,8 @@ from utils.data_loader import (
     split_session_train_val_test,
 )
 
+PROTOCOL_VERSION = "pvn_fig2_algorithm1_v1"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -33,15 +35,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fmax", type=float, default=48.0)
     parser.add_argument("--scale", type=float, default=1e6)
     parser.add_argument("--train_zscore", action="store_true")
+    parser.add_argument("--full_training_session", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--epochs_pvn", type=int, default=300)
     parser.add_argument("--epochs_belief", type=int, default=300)
     parser.add_argument("--rl_steps", type=int, default=50_000)
     parser.add_argument("--actors", type=int, default=8)
+    parser.add_argument("--belief_updates", type=int, default=25)
+    parser.add_argument("--online_belief_epochs", type=int, default=20)
+    parser.add_argument("--actor_sync_every", type=int, default=64)
+    parser.add_argument("--target_sync_every", type=int, default=500)
+    parser.add_argument("--cpu_threads", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--replay_batch_size", type=int, default=16)
     parser.add_argument("--validate_every", type=int, default=500)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--output_dir", default="results/pvn_lbrl_paper_guided")
+    parser.add_argument("--output_dir", default="results/pvn_lbrl_algorithm1")
     return parser.parse_args()
 
 
@@ -70,6 +78,9 @@ def load_split(args: argparse.Namespace, subject: int, seed: int) -> tuple[torch
     X_train, y_train, X_val, y_val, X_test, y_test = split_session_train_val_test(
         X, y, metadata, seed=seed,
     )
+    if getattr(args, "full_training_session", False):
+        X_train, y_train = np.concatenate((X_train, X_val)), np.concatenate((y_train, y_val))
+        X_val, y_val = X_val[:0], y_val[:0]
     X_train = X_train[..., :1000].astype(np.float32) * args.scale
     X_val = X_val[..., :1000].astype(np.float32) * args.scale
     X_test = X_test[..., :1000].astype(np.float32) * args.scale
@@ -108,18 +119,29 @@ def run_subject(args: argparse.Namespace, subject: int, seed: int, output_dir: P
         model, train_online, y_train, val_online, y_val,
         epochs=args.epochs_belief, batch_size=args.batch_size,
     )
+    print(
+        f"PRETRAIN subject={subject} seed={seed} "
+        f"pvn_val_accuracy={pvn_accuracy} "
+        f"belief_val_accuracy={belief_accuracy}",
+        flush=True,
+    )
     val_metrics = train_policy(
         model, train_online, y_train, val_online, y_val, steps=args.rl_steps,
         actors=args.actors, gamma=args.gamma, batch_size=args.replay_batch_size,
+        belief_updates=args.belief_updates, belief_epochs=args.online_belief_epochs,
+        actor_sync_every=args.actor_sync_every, target_every=args.target_sync_every,
         validate_every=args.validate_every,
     )
     # No evaluation-session labels enter fitting, stopping, or checkpoint choice.
     test_metrics = evaluate(model, test_online, y_test)
-    checkpoint = output_dir / f"subject_{subject}_seed_{seed}_best.pth"
+    checkpoint = output_dir / f"subject_{subject}_seed_{seed}_final.pth"
     torch.save({"model_state": model.state_dict(), "config": vars(args),
+                "protocol_version": PROTOCOL_VERSION,
                 "subject": subject, "seed": seed, "validation": val_metrics}, checkpoint)
     result = {
         "dataset": args.dataset, "subject": subject, "seed": seed,
+        "protocol_version": PROTOCOL_VERSION, "q_updates": args.rl_steps,
+        "online_belief_rounds": args.belief_updates, "online_belief_epochs": args.online_belief_epochs,
         "slice_samples": args.slice_samples, "gamma": args.gamma,
         "preprocessing_mode": args.preprocessing_mode, "fmin": args.fmin,
         "fmax": args.fmax, "scale": args.scale, "train_zscore": args.train_zscore,
@@ -157,10 +179,14 @@ def main() -> None:
         raise ValueError("slice_samples must be positive")
     if not 0 <= args.gamma < 1:
         raise ValueError("gamma must be in [0, 1)")
+    if not 0 <= args.belief_updates <= args.rl_steps:
+        raise ValueError("Use --belief_updates <= --rl_steps (reduce both for smoke tests)")
+    torch.set_num_threads(args.cpu_threads)
     root = Path(args.output_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
     config_path = root / "run_config.json"
     config = {key: value for key, value in vars(args).items() if key != "output_dir"}
+    config["protocol_version"] = PROTOCOL_VERSION
     if config_path.exists() and json.loads(config_path.read_text(encoding="utf-8")) != config:
         raise ValueError("Existing output directory has different experiment settings")
     config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
