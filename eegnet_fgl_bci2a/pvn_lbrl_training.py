@@ -255,7 +255,10 @@ def collect_episode(
         observed_encoded.append(encoded_slice.squeeze(0).cpu())
         hidden, belief, q = model.step_encoded(encoded_slice, hidden, prev_action, prev_reward)
         action = random.randrange(2) if random.random() < epsilon else int(q.argmax(-1).item())
-        reward = float(1 if int(belief.argmax(-1).item()) == label else -1) if action == model.HALT else 0.0
+        if action == model.HALT:
+            reward = float(1 if int(belief.argmax(-1).item()) == label else -1)
+        else:
+            reward = -1.0 if index == steps - 1 else 0.0
         action_history.append(action)
         reward_history.append(reward)
         if action == model.HALT:
@@ -364,21 +367,32 @@ def belief_update(
     return float(loss.item())
 
 
-def paper_actor_epsilon(actor: int) -> float:
-    """Section 4.2 uses a one-indexed actor i and epsilon_i = 0.4 ** (7 + i)."""
-    return 0.4 ** (8 + actor)
+def actor_epsilon(actor: int, actors: int, schedule: str) -> float:
+    """Return either the printed PVN-LBRL schedule or the cited R2D2 schedule."""
+    if not 0 <= actor < actors:
+        raise ValueError("actor index must be in [0, actors)")
+    if schedule == "paper_literal":
+        # The article prints epsilon_i = 0.4 ** (7 + i), with one-based i.
+        return 0.4 ** (8 + actor)
+    if schedule == "r2d2_standard":
+        # Kapturowski et al.: epsilon_i = 0.4 ** (1 + 7 i / (N - 1)).
+        exponent = 1.0 if actors == 1 else 1.0 + 7.0 * actor / (actors - 1)
+        return 0.4 ** exponent
+    raise ValueError(f"Unknown epsilon schedule: {schedule}")
 
 
 @torch.no_grad()
 def _collect_actor_round(
     actor_model: PVNLBRL, encoded: torch.Tensor, labels: torch.Tensor,
-    count: int, actors: int, seed: int,
+    count: int, actors: int, seed: int, epsilon_schedule: str,
 ) -> list[Episode]:
     rng = torch.Generator().manual_seed(seed)
     indices = torch.randint(len(labels), (count,), generator=rng)
     trials = encoded[indices]
     y = labels[indices]
-    epsilons = torch.tensor([paper_actor_epsilon(i % actors) for i in range(count)])
+    epsilons = torch.tensor([
+        actor_epsilon(i % actors, actors, epsilon_schedule) for i in range(count)
+    ])
     steps = trials.shape[1]
     actions = torch.empty((count, steps), dtype=torch.long)
     rewards = torch.empty((count, steps))
@@ -391,10 +405,16 @@ def _collect_actor_round(
         explore = torch.rand(len(active), generator=rng) < epsilons[active]
         action = torch.where(explore, torch.randint(2, (len(active),), generator=rng), q_values.argmax(-1))
         halt = action == PVNLBRL.HALT
+        at_limit = step == steps - 1
         actions[active, step] = action
-        rewards[active, step] = torch.where(halt, 2.0 * (belief.argmax(-1) == y[active]).float() - 1.0, 0.0)
-        lengths[active[halt]] = step + 1
-        active, hidden = active[~halt], hidden[~halt]
+        halt_reward = 2.0 * (belief.argmax(-1) == y[active]).float() - 1.0
+        rewards[active, step] = torch.where(
+            halt, halt_reward,
+            torch.full_like(halt_reward, -1.0 if at_limit else 0.0),
+        )
+        done = halt | at_limit
+        lengths[active[done]] = step + 1
+        active, hidden = active[~done], hidden[~done]
         if len(active) == 0:
             break
     return [
@@ -411,12 +431,16 @@ def train_policy(
     belief_updates: int = 25, belief_epochs: int = 20,
     actor_sync_every: int = 64, target_every: int = 500,
     validate_every: int = 500, lr: float = 1e-4,
+    epsilon_schedule: str = "r2d2_standard",
+    replay_warmup_episodes: int = 1024,
 ) -> dict[str, float]:
     if not 0 <= gamma < 1 or min(actors, steps, batch_size, actor_sync_every,
                                 target_every, validate_every, replay_capacity, len(y)) < 1:
         raise ValueError("Invalid gamma, empty training data, or non-positive schedule")
-    if not 0 <= belief_updates <= steps or belief_epochs < 1:
+    if (not 0 <= belief_updates <= steps or belief_epochs < 1
+            or not 0 <= replay_warmup_episodes <= replay_capacity):
         raise ValueError("Belief rounds must be between 0 and steps, with at least one epoch")
+    epsilons = [actor_epsilon(i, actors, epsilon_schedule) for i in range(actors)]
     model.encoder.requires_grad_(False)
     model.encoder.eval()
     target = copy.deepcopy(model).eval()
@@ -428,15 +452,39 @@ def train_policy(
     replay = PrioritizedEpisodeReplay(replay_capacity)
     slices = SliceReplay(replay_capacity)
     labels = y.cpu()
-    rounds = {(i * steps) // belief_updates for i in range(1, belief_updates + 1)}
+    rounds = (
+        {(i * steps) // belief_updates for i in range(1, belief_updates + 1)}
+        if belief_updates else set()
+    )
     completed_rounds = 0
-    print(f"Actor epsilon: {[paper_actor_epsilon(i) for i in range(actors)]}", flush=True)
+    print(f"Actor epsilon schedule={epsilon_schedule}: {epsilons}", flush=True)
+
+    def add_episodes(episodes: list[Episode]) -> None:
+        for episode in episodes:
+            replay.add(episode)
+            slices.add(episode)
+
+    while len(replay) < replay_warmup_episodes:
+        count = min(actor_sync_every, replay_warmup_episodes - len(replay))
+        snapshot = copy.deepcopy(model).cpu().eval()
+        add_episodes(_collect_actor_round(
+            snapshot, encoded_train, labels, count, actors,
+            random.randrange(2**32), epsilon_schedule,
+        ))
+    if replay_warmup_episodes:
+        warm_lengths = [len(episode.actions) for episode in replay.episodes.values()]
+        print(
+            f"Replay warm-up complete | episodes={len(replay)} "
+            f"transitions={replay.transition_count} mean_slices={np.mean(warm_lengths):.3f} "
+            f"first_slice_rate={np.mean(np.asarray(warm_lengths) == 1):.3f}",
+            flush=True,
+        )
 
     def submit(executor: ThreadPoolExecutor, remaining: int):
         snapshot = copy.deepcopy(model).cpu().eval()
         count = max(actors, min(remaining, actor_sync_every))
         return executor.submit(_collect_actor_round, snapshot, encoded_train, labels,
-                               count, actors, random.randrange(2**32))
+                               count, actors, random.randrange(2**32), epsilon_schedule)
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = submit(executor, steps)
@@ -445,9 +493,7 @@ def train_policy(
             end = min(start + actor_sync_every, steps)
             if end < steps:
                 future = submit(executor, steps - end)
-            for episode in episodes:
-                replay.add(episode)
-                slices.add(episode)
+            add_episodes(episodes)
             for step in range(start + 1, end + 1):
                 q_update(model, target, replay, q_optimizer, gamma, batch_size)
                 if step in rounds:
@@ -462,6 +508,10 @@ def train_policy(
                     target.load_state_dict(model.state_dict())
                 if step % validate_every == 0 or step == steps:
                     diagnostics = f" val={evaluate(model, X_val, y_val)}" if len(y_val) else ""
+                    recent_lengths = np.asarray([len(episode.actions) for episode in episodes])
                     print(f"Q updates {step}/{steps} replay={len(replay)} "
-                          f"slice_replay={len(slices.entries)}{diagnostics}", flush=True)
+                          f"slice_replay={len(slices.entries)} "
+                          f"recent_mean_slices={recent_lengths.mean():.3f} "
+                          f"recent_first_slice_rate={(recent_lengths == 1).mean():.3f}"
+                          f"{diagnostics}", flush=True)
     return evaluate(model, X_val, y_val) if len(y_val) else {}

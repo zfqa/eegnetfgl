@@ -14,8 +14,8 @@ of the published method, not a verified reproduction of the reported results.
 | Sec. 3.3, Fig. 2, Eq. 4 | Spatial projection (16 filters), shared SAME temporal filters (24 filters) applied to each spatial component independently, layer normalization over their joint features, spatial mixing into 48 channels, second layer normalization, per-point class logits, then hard temporal voting for offline prediction. |
 | Sec. 3.3, Fig. 1, Eq. 5 | One slice at a time: PVN, linear projection, previous action/reward, 256-unit GRU, belief decoder with temporal average, and dueling Q head. |
 | Sec. 3.4, Eqs. 6-8, Sec. 4.2 | PVN cross-entropy pretraining (300 epochs), then frozen PVN and uniformly sampled HALT/WAIT rollouts for belief NLL (300 epochs). The HALT slice is included; later slices are excluded from the objective. Both stages use AdamW at 1e-3. |
-| Algorithm 1, Sec. 4.2 | Eight epsilon-greedy actor policies, exploration rates `0.4 ** (7 + i)` for one-based `i`, prioritized replay capped at one million transitions, and separate uniform slice-label replay for the belief learner. Q receives 50,000 optimizer updates and belief receives 25 rounds of 20 epochs, both with AdamW at 1e-4. |
-| Sec. 3.1, Eqs. 1-3 | HALT emits the belief argmax and has reward +1/-1. WAIT has reward 0 for an observed slice. The last complete slice terminates the episode; a last-slice WAIT is not relabeled as HALT and does not bootstrap. The evaluator uses the last belief as a fallback if the policy never chooses HALT. |
+| Algorithm 1, Sec. 4.2 | Eight epsilon-greedy actor policies, prioritized replay capped at one million transitions, and separate uniform slice-label replay for the belief learner. Q receives 50,000 optimizer updates and belief receives 25 rounds of 20 epochs, both with AdamW at 1e-4. |
+| Sec. 3.1, Eqs. 1-3 | HALT emits the belief argmax and has reward +1/-1. WAIT has reward 0 before the limit. At the last complete slice, WAIT terminates with -1 as the equation's `else` case and does not bootstrap. The evaluator uses the last belief as a fallback if the policy never chooses HALT. |
 | Secs. 4.3, 4.5-4.7 | Accuracy, mean observation time and ITR (Eq. 9), plus local F1/kappa diagnostics. The Table 4 settings use gamma 0.1 with slice sizes 40/60/80/100; the conservative analysis uses 100 samples and gamma 0.997. |
 
 ## Reproduction choices and limitations
@@ -37,6 +37,29 @@ updates after the initial collection. This is not the authors' distributed
 implementation. Cached encoder features are computed per slice with the
 PVN frozen; test-time encoding only processes the current slice. No
 minimum observation time or additional WAIT reward has been introduced.
+
+### Exploration ambiguity and controlled correction
+
+The PVN-LBRL article literally prints `epsilon_i = 0.4 ** (7 + i)` for
+one-based actor index `i`. With eight actors this is approximately
+`6.55e-4 ... 1.07e-6`. In the first complete local run this produced almost
+no exploration: 50,000 episodes contained only 50,794 slices and the policy
+halted every test trial at 0.16 s. The cited R2D2 method instead uses
+`epsilon_i = 0.4 ** (1 + 7 i / (N - 1))` for zero-based `i`, spanning
+`0.4 ... 6.55e-4` with eight actors.
+
+The runner therefore exposes both auditable modes:
+
+- `--epsilon_schedule paper_literal`: the formula printed by PVN-LBRL;
+- `--epsilon_schedule r2d2_standard`: the schedule from the cited R2D2
+  algorithm and the default controlled correction.
+
+Because PVN-LBRL does not report when its Q learner begins relative to actor
+collection, the corrected mode also defaults to
+`--replay_warmup_episodes 1024`. This is an explicit implementation choice,
+not a claim about the unavailable author code. Set it to zero for an immediate
+learner start. Logs report warm-up/recent mean slices and first-slice halt rate,
+so policy collapse can be detected before a full run finishes.
 
 The final iterate is used, with no validation-ITR checkpoint selection.
 `--no-full_training_session` is available for an independent hold-out
@@ -67,6 +90,7 @@ CUDA_VISIBLE_DEVICES=3 python -u run_pvn_lbrl_ablation.py \
   --subjects 1 --seeds 42 --slice_samples 40 --gamma 0.1 \
   --data_dir data --epochs_pvn 1 --epochs_belief 1 --rl_steps 4 \
   --belief_updates 1 --online_belief_epochs 1 \
+  --epsilon_schedule r2d2_standard --replay_warmup_episodes 16 \
   --replay_batch_size 4 --validate_every 2 --device cuda \
   --output_dir results/pvn_lbrl_algorithm1_smoke
 ```
@@ -77,8 +101,10 @@ First scientific pilot, one subject and one seed:
 CUDA_VISIBLE_DEVICES=3 nohup python -u run_pvn_lbrl_ablation.py \
   --subjects 1 --seeds 42 --slice_samples 40 --gamma 0.1 \
   --data_dir data --epochs_pvn 300 --epochs_belief 300 \
-  --rl_steps 50000 --belief_updates 25 --online_belief_epochs 20 --device cuda \
-  --output_dir results/pvn_lbrl_algorithm1_pilot_s1 > pvn_lbrl_algorithm1_pilot_s1.out 2>&1 &
+  --rl_steps 50000 --belief_updates 25 --online_belief_epochs 20 \
+  --epsilon_schedule r2d2_standard --replay_warmup_episodes 1024 --device cuda \
+  --output_dir results/pvn_lbrl_r2d2_corrected_pilot_s1 \
+  > pvn_lbrl_r2d2_corrected_pilot_s1.out 2>&1 &
 ```
 
 After reviewing that pilot, rerun 9 subjects and repeated seeds in a new

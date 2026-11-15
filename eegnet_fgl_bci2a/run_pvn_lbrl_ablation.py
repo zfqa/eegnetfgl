@@ -19,7 +19,7 @@ from utils.data_loader import (
     split_session_train_val_test,
 )
 
-PROTOCOL_VERSION = "pvn_fig2_algorithm1_v1"
+PROTOCOL_VERSION = "pvn_fig2_algorithm1_r2d2_exploration_v2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +40,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs_belief", type=int, default=300)
     parser.add_argument("--rl_steps", type=int, default=50_000)
     parser.add_argument("--actors", type=int, default=8)
+    parser.add_argument(
+        "--epsilon_schedule", choices=["paper_literal", "r2d2_standard"],
+        default="r2d2_standard",
+        help="Printed PVN-LBRL formula or the standard schedule from its cited R2D2 method.",
+    )
+    parser.add_argument(
+        "--replay_warmup_episodes", type=int, default=1024,
+        help="Collect this many complete episodes before the first Q update (not reported by PVN-LBRL).",
+    )
     parser.add_argument("--belief_updates", type=int, default=25)
     parser.add_argument("--online_belief_epochs", type=int, default=20)
     parser.add_argument("--actor_sync_every", type=int, default=64)
@@ -130,7 +139,8 @@ def run_subject(args: argparse.Namespace, subject: int, seed: int, output_dir: P
         actors=args.actors, gamma=args.gamma, batch_size=args.replay_batch_size,
         belief_updates=args.belief_updates, belief_epochs=args.online_belief_epochs,
         actor_sync_every=args.actor_sync_every, target_every=args.target_sync_every,
-        validate_every=args.validate_every,
+        validate_every=args.validate_every, epsilon_schedule=args.epsilon_schedule,
+        replay_warmup_episodes=args.replay_warmup_episodes,
     )
     # No evaluation-session labels enter fitting, stopping, or checkpoint choice.
     test_metrics = evaluate(model, test_online, y_test)
@@ -142,6 +152,8 @@ def run_subject(args: argparse.Namespace, subject: int, seed: int, output_dir: P
         "dataset": args.dataset, "subject": subject, "seed": seed,
         "protocol_version": PROTOCOL_VERSION, "q_updates": args.rl_steps,
         "online_belief_rounds": args.belief_updates, "online_belief_epochs": args.online_belief_epochs,
+        "epsilon_schedule": args.epsilon_schedule,
+        "replay_warmup_episodes": args.replay_warmup_episodes,
         "slice_samples": args.slice_samples, "gamma": args.gamma,
         "preprocessing_mode": args.preprocessing_mode, "fmin": args.fmin,
         "fmax": args.fmax, "scale": args.scale, "train_zscore": args.train_zscore,

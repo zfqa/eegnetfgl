@@ -13,7 +13,7 @@ from run_pvn_lbrl_ablation import complete_online_samples, load_split
 import pvn_lbrl_training as training
 from pvn_lbrl_training import (
     Episode, PrioritizedEpisodeReplay, SliceReplay, belief_update, collect_episode,
-    evaluate, itr_bits_per_minute, paper_actor_epsilon, q_rescale, q_unscale,
+    actor_epsilon, evaluate, itr_bits_per_minute, q_rescale, q_unscale,
     q_update, r2d2_targets, train_policy, uniform_rollout_mask,
 )
 from utils.data_loader import split_session_train_val_test
@@ -117,7 +117,7 @@ def test_actor_reward_and_replay_updates(model: PVNLBRL) -> None:
     force_action(model, PVNLBRL.WAIT)
     episode = collect_episode(model, torch.randn(3, 120), label=1, epsilon=0)
     assert episode.actions == [PVNLBRL.WAIT] * 3
-    assert episode.rewards == [0.0] * 3
+    assert episode.rewards == [0.0, 0.0, -1.0]
     replay = PrioritizedEpisodeReplay(capacity=3)
     replay.add(episode)
     q_optimizer = torch.optim.AdamW(model.q_network.parameters(), lr=1e-4)
@@ -134,7 +134,7 @@ def test_actor_reward_and_replay_updates(model: PVNLBRL) -> None:
     assert replay.priorities[0] > 0
 
 
-def test_halt_rewards_and_actor_agreement(model: PVNLBRL) -> None:
+def test_halt_rewards_and_actor_agreement(model: PVNLBRL, monkeypatch) -> None:
     force_action(model, PVNLBRL.HALT)
     trial = torch.randn(3, 120)
     with torch.no_grad():
@@ -143,10 +143,26 @@ def test_halt_rewards_and_actor_agreement(model: PVNLBRL) -> None:
     label = int(belief.argmax(-1))
     assert collect_episode(model, trial, label, epsilon=0).rewards == [1.]
     assert collect_episode(model, trial, (label + 1) % 4, epsilon=0).rewards == [-1.]
-    episodes = training._collect_actor_round(model, encoded, torch.tensor([label]), 8, 8, 42)
+    monkeypatch.setattr(training, "actor_epsilon", lambda *args: 0.0)
+    episodes = training._collect_actor_round(
+        model, encoded, torch.tensor([label]), 8, 8, 42, "paper_literal",
+    )
     assert all(ep.actions == [PVNLBRL.HALT] and ep.rewards == [1.] for ep in episodes)
-    assert paper_actor_epsilon(0) == pytest.approx(0.4 ** 8)
-    assert paper_actor_epsilon(7) == pytest.approx(0.4 ** 15)
+    assert actor_epsilon(0, 8, "paper_literal") == pytest.approx(0.4 ** 8)
+    assert actor_epsilon(7, 8, "paper_literal") == pytest.approx(0.4 ** 15)
+    assert actor_epsilon(0, 8, "r2d2_standard") == pytest.approx(0.4)
+    assert actor_epsilon(7, 8, "r2d2_standard") == pytest.approx(0.4 ** 8)
+
+
+def test_last_slice_wait_is_terminal_negative_reward(model: PVNLBRL, monkeypatch) -> None:
+    force_action(model, PVNLBRL.WAIT)
+    monkeypatch.setattr(training, "actor_epsilon", lambda *args: 0.0)
+    encoded = model.encode_sequence(torch.randn(1, 3, 120))
+    episode = training._collect_actor_round(
+        model, encoded, torch.tensor([0]), 1, 1, 42, "r2d2_standard",
+    )[0]
+    assert episode.actions == [PVNLBRL.WAIT] * 3
+    assert episode.rewards == [0.0, 0.0, -1.0]
 
 
 def test_uniform_action_pretraining_observes_halt_but_not_later_slices() -> None:
@@ -177,14 +193,20 @@ def test_priority_capacity_counts_transitions_and_wraps() -> None:
 
 def test_exact_q_updates_and_belief_rounds(model: PVNLBRL, monkeypatch) -> None:
     calls = []
-    monkeypatch.setattr(training, "q_update", lambda *args: calls.append("q"))
+    replay_sizes = []
+    def record_q(*args):
+        replay_sizes.append(len(args[2]))
+        calls.append("q")
+    monkeypatch.setattr(training, "q_update", record_q)
     monkeypatch.setattr(training, "belief_update", lambda *args: calls.append("belief"))
     x = torch.randn(2, 3, 80)
     y = torch.tensor([0, 1])
     result = train_policy(copy.deepcopy(model), x, y, x[:0], y[:0], steps=5, actors=2,
                           replay_capacity=32, batch_size=4, actor_sync_every=2,
-                          belief_updates=2, belief_epochs=3, validate_every=2)
+                          belief_updates=2, belief_epochs=3, validate_every=2,
+                          replay_warmup_episodes=4)
     assert result == {}
+    assert replay_sizes[0] >= 4
     assert calls == ["q", "q", *(["belief"] * 3), "q", "q", "q", *(["belief"] * 3)]
 
 
