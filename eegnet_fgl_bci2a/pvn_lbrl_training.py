@@ -385,12 +385,15 @@ def actor_epsilon(actor: int, actors: int, schedule: str) -> float:
 def _collect_actor_round(
     actor_model: PVNLBRL, encoded: torch.Tensor, labels: torch.Tensor,
     count: int, actors: int, seed: int, epsilon_schedule: str,
+    epsilon_override: float | None = None,
 ) -> list[Episode]:
     rng = torch.Generator().manual_seed(seed)
     indices = torch.randint(len(labels), (count,), generator=rng)
     trials = encoded[indices]
     y = labels[indices]
-    epsilons = torch.tensor([
+    if epsilon_override is not None and not 0 <= epsilon_override <= 1:
+        raise ValueError("epsilon_override must be in [0, 1]")
+    epsilons = torch.full((count,), float(epsilon_override)) if epsilon_override is not None else torch.tensor([
         actor_epsilon(i % actors, actors, epsilon_schedule) for i in range(count)
     ])
     steps = trials.shape[1]
@@ -423,6 +426,20 @@ def _collect_actor_round(
     ]
 
 
+@torch.no_grad()
+def first_slice_policy_stats(
+    model: PVNLBRL, encoded: torch.Tensor, batch_size: int = 64,
+) -> tuple[float, float]:
+    """Return greedy first-slice HALT rate and Q(WAIT)-Q(HALT) margin."""
+    device = next(model.parameters()).device
+    halt, margins = [], []
+    for batch in encoded[:, 0].split(batch_size):
+        _, _, q_values = model.step_encoded(batch.to(device))
+        halt.append((q_values.argmax(-1) == PVNLBRL.HALT).float().cpu())
+        margins.append((q_values[:, PVNLBRL.WAIT] - q_values[:, PVNLBRL.HALT]).cpu())
+    return float(torch.cat(halt).mean()), float(torch.cat(margins).mean())
+
+
 def train_policy(
     model: PVNLBRL, X: torch.Tensor, y: torch.Tensor,
     X_val: torch.Tensor, y_val: torch.Tensor,
@@ -433,12 +450,14 @@ def train_policy(
     validate_every: int = 500, lr: float = 1e-4,
     epsilon_schedule: str = "r2d2_standard",
     replay_warmup_episodes: int = 1024,
+    replay_warmup_epsilon: float = 1.0,
 ) -> dict[str, float]:
     if not 0 <= gamma < 1 or min(actors, steps, batch_size, actor_sync_every,
                                 target_every, validate_every, replay_capacity, len(y)) < 1:
         raise ValueError("Invalid gamma, empty training data, or non-positive schedule")
     if (not 0 <= belief_updates <= steps or belief_epochs < 1
-            or not 0 <= replay_warmup_episodes <= replay_capacity):
+            or not 0 <= replay_warmup_episodes <= replay_capacity
+            or not 0 <= replay_warmup_epsilon <= 1):
         raise ValueError("Belief rounds must be between 0 and steps, with at least one epoch")
     epsilons = [actor_epsilon(i, actors, epsilon_schedule) for i in range(actors)]
     model.encoder.requires_grad_(False)
@@ -458,6 +477,12 @@ def train_policy(
     )
     completed_rounds = 0
     print(f"Actor epsilon schedule={epsilon_schedule}: {epsilons}", flush=True)
+    initial_halt_rate, initial_q_margin = first_slice_policy_stats(model, encoded_train)
+    print(
+        f"Initial greedy first-slice policy | halt_rate={initial_halt_rate:.3f} "
+        f"q_wait_minus_halt={initial_q_margin:.6f}",
+        flush=True,
+    )
 
     def add_episodes(episodes: list[Episode]) -> None:
         for episode in episodes:
@@ -470,13 +495,15 @@ def train_policy(
         add_episodes(_collect_actor_round(
             snapshot, encoded_train, labels, count, actors,
             random.randrange(2**32), epsilon_schedule,
+            epsilon_override=replay_warmup_epsilon,
         ))
     if replay_warmup_episodes:
         warm_lengths = [len(episode.actions) for episode in replay.episodes.values()]
         print(
             f"Replay warm-up complete | episodes={len(replay)} "
             f"transitions={replay.transition_count} mean_slices={np.mean(warm_lengths):.3f} "
-            f"first_slice_rate={np.mean(np.asarray(warm_lengths) == 1):.3f}",
+            f"first_slice_rate={np.mean(np.asarray(warm_lengths) == 1):.3f} "
+            f"epsilon={replay_warmup_epsilon:.3f}",
             flush=True,
         )
 
@@ -509,9 +536,12 @@ def train_policy(
                 if step % validate_every == 0 or step == steps:
                     diagnostics = f" val={evaluate(model, X_val, y_val)}" if len(y_val) else ""
                     recent_lengths = np.asarray([len(episode.actions) for episode in episodes])
+                    greedy_halt_rate, q_margin = first_slice_policy_stats(model, encoded_train)
                     print(f"Q updates {step}/{steps} replay={len(replay)} "
                           f"slice_replay={len(slices.entries)} "
                           f"recent_mean_slices={recent_lengths.mean():.3f} "
                           f"recent_first_slice_rate={(recent_lengths == 1).mean():.3f}"
+                          f" greedy_first_halt_rate={greedy_halt_rate:.3f} "
+                          f"q_wait_minus_halt={q_margin:.6f}"
                           f"{diagnostics}", flush=True)
     return evaluate(model, X_val, y_val) if len(y_val) else {}

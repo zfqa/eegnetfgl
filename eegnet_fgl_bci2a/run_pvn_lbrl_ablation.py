@@ -19,7 +19,7 @@ from utils.data_loader import (
     split_session_train_val_test,
 )
 
-PROTOCOL_VERSION = "pvn_fig2_algorithm1_r2d2_exploration_v2"
+PROTOCOL_VERSION = "pvn_fig2_algorithm1_balanced_warmup_v3"
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,6 +48,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--replay_warmup_episodes", type=int, default=1024,
         help="Collect this many complete episodes before the first Q update (not reported by PVN-LBRL).",
+    )
+    parser.add_argument(
+        "--replay_warmup_epsilon", type=float, default=1.0,
+        help="Exploration rate used only during replay warm-up; 1.0 gives balanced random actions.",
     )
     parser.add_argument("--belief_updates", type=int, default=25)
     parser.add_argument("--online_belief_epochs", type=int, default=20)
@@ -141,6 +145,7 @@ def run_subject(args: argparse.Namespace, subject: int, seed: int, output_dir: P
         actor_sync_every=args.actor_sync_every, target_every=args.target_sync_every,
         validate_every=args.validate_every, epsilon_schedule=args.epsilon_schedule,
         replay_warmup_episodes=args.replay_warmup_episodes,
+        replay_warmup_epsilon=args.replay_warmup_epsilon,
     )
     # No evaluation-session labels enter fitting, stopping, or checkpoint choice.
     test_metrics = evaluate(model, test_online, y_test)
@@ -154,6 +159,7 @@ def run_subject(args: argparse.Namespace, subject: int, seed: int, output_dir: P
         "online_belief_rounds": args.belief_updates, "online_belief_epochs": args.online_belief_epochs,
         "epsilon_schedule": args.epsilon_schedule,
         "replay_warmup_episodes": args.replay_warmup_episodes,
+        "replay_warmup_epsilon": args.replay_warmup_epsilon,
         "slice_samples": args.slice_samples, "gamma": args.gamma,
         "preprocessing_mode": args.preprocessing_mode, "fmin": args.fmin,
         "fmax": args.fmax, "scale": args.scale, "train_zscore": args.train_zscore,
@@ -193,6 +199,8 @@ def main() -> None:
         raise ValueError("gamma must be in [0, 1)")
     if not 0 <= args.belief_updates <= args.rl_steps:
         raise ValueError("Use --belief_updates <= --rl_steps (reduce both for smoke tests)")
+    if not 0 <= args.replay_warmup_epsilon <= 1:
+        raise ValueError("replay_warmup_epsilon must be in [0, 1]")
     torch.set_num_threads(args.cpu_threads)
     root = Path(args.output_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)

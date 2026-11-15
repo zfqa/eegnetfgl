@@ -165,6 +165,18 @@ def test_last_slice_wait_is_terminal_negative_reward(model: PVNLBRL, monkeypatch
     assert episode.rewards == [0.0, 0.0, -1.0]
 
 
+def test_uniform_random_warmup_is_not_locked_to_initial_halt_bias(model: PVNLBRL) -> None:
+    force_action(model, PVNLBRL.HALT)
+    encoded = model.encode_sequence(torch.randn(4, 3, 120))
+    episodes = training._collect_actor_round(
+        model, encoded, torch.tensor([0, 1, 2, 3]), 128, 8, 42,
+        "r2d2_standard", epsilon_override=1.0,
+    )
+    first_actions = np.asarray([episode.actions[0] for episode in episodes])
+    assert 0.35 < np.mean(first_actions == PVNLBRL.HALT) < 0.65
+    assert any(len(episode.actions) > 1 for episode in episodes)
+
+
 def test_uniform_action_pretraining_observes_halt_but_not_later_slices() -> None:
     actions = torch.tensor([[0, 1, 1], [1, 0, 1], [1, 1, 1]])
     assert uniform_rollout_mask(actions).tolist() == [[True, False, False], [True, True, False], [True, True, True]]
@@ -204,7 +216,7 @@ def test_exact_q_updates_and_belief_rounds(model: PVNLBRL, monkeypatch) -> None:
     result = train_policy(copy.deepcopy(model), x, y, x[:0], y[:0], steps=5, actors=2,
                           replay_capacity=32, batch_size=4, actor_sync_every=2,
                           belief_updates=2, belief_epochs=3, validate_every=2,
-                          replay_warmup_episodes=4)
+                          replay_warmup_episodes=4, replay_warmup_epsilon=1.0)
     assert result == {}
     assert replay_sizes[0] >= 4
     assert calls == ["q", "q", *(["belief"] * 3), "q", "q", "q", *(["belief"] * 3)]

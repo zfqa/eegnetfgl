@@ -56,10 +56,14 @@ The runner therefore exposes both auditable modes:
 
 Because PVN-LBRL does not report when its Q learner begins relative to actor
 collection, the corrected mode also defaults to
-`--replay_warmup_episodes 1024`. This is an explicit implementation choice,
-not a claim about the unavailable author code. Set it to zero for an immediate
-learner start. Logs report warm-up/recent mean slices and first-slice halt rate,
-so policy collapse can be detected before a full run finishes.
+`--replay_warmup_episodes 1024`. Warm-up uses uniformly random actions
+(`--replay_warmup_epsilon 1.0`) so that a random initial Q-head preference
+cannot fill replay almost exclusively with one-slice HALT episodes. This is an
+explicit implementation choice, not a claim about the unavailable author
+code. Set the episode count to zero for an immediate learner start, or set the
+warm-up epsilon to the ordinary actor schedule only for a collapse-control
+experiment. Logs report warm-up/recent mean slices, first-slice halt rate,
+greedy first-slice HALT rate, and the mean Q(WAIT)-Q(HALT) margin.
 
 The final iterate is used, with no validation-ITR checkpoint selection.
 `--no-full_training_session` is available for an independent hold-out
@@ -102,7 +106,8 @@ CUDA_VISIBLE_DEVICES=3 nohup python -u run_pvn_lbrl_ablation.py \
   --subjects 1 --seeds 42 --slice_samples 40 --gamma 0.1 \
   --data_dir data --epochs_pvn 300 --epochs_belief 300 \
   --rl_steps 50000 --belief_updates 25 --online_belief_epochs 20 \
-  --epsilon_schedule r2d2_standard --replay_warmup_episodes 1024 --device cuda \
+  --epsilon_schedule r2d2_standard --replay_warmup_episodes 1024 \
+  --replay_warmup_epsilon 1.0 --device cuda \
   --output_dir results/pvn_lbrl_r2d2_corrected_pilot_s1 \
   > pvn_lbrl_r2d2_corrected_pilot_s1.out 2>&1 &
 ```
