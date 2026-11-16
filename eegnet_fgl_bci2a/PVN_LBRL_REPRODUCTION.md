@@ -121,3 +121,13 @@ not reported, so explicitly record the local seed list. The runner writes
 `summary.csv`, model checkpoints, and `run_config.json`. Re-running an
 identical command skips completed subject/seed rows; it rejects a changed
 configuration in the same output directory.
+
+After a run, compare train/test prefix accuracy and stopping behavior without
+using evaluation-session labels for fitting:
+
+```bash
+python -u diagnose_pvn_policy.py \
+  --checkpoint results/pvn_lbrl_balanced_warmup_s1/subject_1_seed_42_final.pth \
+  --data_dir data --device cuda --splits train test \
+  --output_dir results/pvn_lbrl_balanced_warmup_s1/diagnostics
+```

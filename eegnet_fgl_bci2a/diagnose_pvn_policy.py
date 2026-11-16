@@ -1,4 +1,4 @@
-"""Validation-only prefix curve and stopping audit for a PVN-LBRL checkpoint."""
+"""Post-training prefix curves and stopping audit for a PVN-LBRL checkpoint."""
 
 from __future__ import annotations
 
@@ -53,36 +53,53 @@ def main() -> None:
     parser.add_argument("--data_dir", default="data")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument(
+        "--splits", nargs="+", choices=["train", "val", "test"],
+        default=["val"],
+        help="Evaluate selected splits after training. Test diagnostics never affect fitting.",
+    )
     args = parser.parse_args()
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     if checkpoint.get("protocol_version") != PROTOCOL_VERSION:
         parser.error("Checkpoint uses a different PVN architecture; use its original code version")
     config = argparse.Namespace(**checkpoint["config"])
-    if config.full_training_session:
-        parser.error("This checkpoint used the entire training session and has no held-out validation set")
     config.data_dir = args.data_dir
     subject = int(checkpoint["subject"])
     seed = int(checkpoint["seed"])
-    X_train, _, X_val, y_val, _, _ = load_split(config, subject, seed)
+    X_train, y_train, X_val, y_val, X_test, y_test = load_split(config, subject, seed)
     online_samples = complete_online_samples(X_train.shape[-1], config.slice_samples)
     model = PVNLBRL(
         channels=X_train.shape[1], classes=4, slice_samples=config.slice_samples,
     ).to(args.device)
     model.load_state_dict(checkpoint["model_state"])
-    prefix, halts, policy = validation_diagnostics(model, X_val[..., :online_samples], y_val)
-    expected = checkpoint.get("validation", {})
-    if "accuracy" in expected and abs(policy["accuracy"] - expected["accuracy"]) > 1e-6:
-        raise ValueError("Validation accuracy disagrees with checkpoint metadata; verify data and code versions")
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    prefix.to_csv(output / "validation_prefix_curve.csv", index=False)
-    halts.to_csv(output / "validation_halt_distribution.csv", index=False)
-    print("Validation policy:", policy)
-    print("Fixed-prefix validation curve:")
-    print(prefix.to_string(index=False, float_format=lambda value: f"{value:.4f}"))
-    print("Validation halt counts:")
-    print(halts.to_string(index=False))
-    print(f"Saved validation-only diagnostics to {output.resolve()}")
+    available = {
+        "train": (X_train, y_train),
+        "val": (X_val, y_val),
+        "test": (X_test, y_test),
+    }
+    summary = []
+    for split in args.splits:
+        x, y = available[split]
+        if not len(y):
+            print(f"Skipping empty {split} split", flush=True)
+            continue
+        prefix, halts, policy = validation_diagnostics(model, x[..., :online_samples], y)
+        if split == "val":
+            expected = checkpoint.get("validation", {})
+            if "accuracy" in expected and abs(policy["accuracy"] - expected["accuracy"]) > 1e-6:
+                raise ValueError("Validation accuracy disagrees with checkpoint metadata; verify data and code versions")
+        prefix.to_csv(output / f"{split}_prefix_curve.csv", index=False)
+        halts.to_csv(output / f"{split}_halt_distribution.csv", index=False)
+        summary.append({"split": split, **policy})
+        print(f"\n{split.upper()} policy:", policy)
+        print(f"Fixed-prefix {split} curve:")
+        print(prefix.to_string(index=False, float_format=lambda value: f"{value:.4f}"))
+        print(f"{split.capitalize()} halt counts:")
+        print(halts.to_string(index=False))
+    pd.DataFrame(summary).to_csv(output / "split_policy_summary.csv", index=False)
+    print(f"Saved post-training diagnostics to {output.resolve()}")
 
 
 if __name__ == "__main__":
