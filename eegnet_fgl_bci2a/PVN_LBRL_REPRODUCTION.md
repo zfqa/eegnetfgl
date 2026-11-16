@@ -10,7 +10,7 @@ of the published method, not a verified reproduction of the reported results.
 
 | Paper | Implementation |
 | --- | --- |
-| Sec. 4.1 | Within-subject session split, 1-48 Hz, 4 s trials and voltage scaling by 1e6. The default fits on the entire training session and evaluates once on the separate test session. |
+| Sec. 4.1 | Within-subject session split, 1-48 Hz, and 4 s trials in microvolts. The default fits on the entire training session and evaluates once on the separate test session. |
 | Sec. 3.3, Fig. 2, Eq. 4 | Spatial projection (16 filters), shared SAME temporal filters (24 filters) applied to each spatial component independently, layer normalization over their joint features, spatial mixing into 48 channels, second layer normalization, per-point class logits, then hard temporal voting for offline prediction. |
 | Sec. 3.3, Fig. 1, Eq. 5 | One slice at a time: PVN, linear projection, previous action/reward, 256-unit GRU, belief decoder with temporal average, and dueling Q head. |
 | Sec. 3.4, Eqs. 6-8, Sec. 4.2 | PVN cross-entropy pretraining (300 epochs), then frozen PVN and uniformly sampled HALT/WAIT rollouts for belief NLL (300 epochs). The HALT slice is included; later slices are excluded from the objective. Both stages use AdamW at 1e-3. |
@@ -19,6 +19,12 @@ of the published method, not a verified reproduction of the reported results.
 | Secs. 4.3, 4.5-4.7 | Accuracy, mean observation time and ITR (Eq. 9), plus local F1/kappa diagnostics. The Table 4 settings use gamma 0.1 with slice sizes 40/60/80/100; the conservative analysis uses 100 samples and gamma 0.997. |
 
 ## Reproduction choices and limitations
+
+The MOABB array loader already converts volts to microvolts. The causal BNCI
+MAT loader keeps the original microvolt units. The runner therefore defaults
+to `--scale 1` for both paths. Previous default runs multiplied these arrays
+by an additional `1e6`; pass `--scale 1e6` only to reproduce that legacy
+setting. Keep corrected results in a separate output directory.
 
 The article does not specify the exact FIR bank, differentiable voting
 objective, actor/target synchronization intervals, online epoch size, or
@@ -131,3 +137,50 @@ python -u diagnose_pvn_policy.py \
   --data_dir data --device cuda --splits train test \
   --output_dir results/pvn_lbrl_balanced_warmup_s1/diagnostics
 ```
+
+To locate a first-slice generalization gap, run an independent audit with a
+validation split inside the training session. This reports the full-window PVN
+vote and the GRU fixed-prefix accuracy before RL and after 500 Q-only updates.
+The belief learner is disabled to isolate the Q phase; the held-out test session
+is not scored and no final policy checkpoint is emitted.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u run_pvn_lbrl_ablation.py \
+  --subjects 1 --seeds 42 --audit_prefixes --no-full_training_session \
+  --slice_samples 40 --gamma 0.1 --rl_steps 500 --belief_updates 0 \
+  --data_dir data --device cuda --output_dir results/pvn_lbrl_prefix_audit_s1_q500
+```
+
+Use `--rl_steps 0` with a separate output directory to stop after pretraining.
+The audit writes `subject_1_seed_42_prefix_audit.csv` and prints the first and
+last prefix accuracies. Use the validation split, not the prior test scores, to
+compare changes to the encoder, belief learner, or stopping policy.
+
+For a supervised A/B comparison without RL, add `--compare_prefix_training`.
+Both arms share one frozen PVN, the initial belief-model weights, batch order,
+and the number of supervised prefixes per trial. The balanced arm samples
+those prefix lengths uniformly without replacement. This arm is a local
+modification, not part of the paper-guided reproduction.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u run_pvn_lbrl_ablation.py \
+  --subjects 1 --seeds 42 --audit_prefixes --compare_prefix_training \
+  --no-full_training_session --slice_samples 40 --rl_steps 0 --belief_updates 0 \
+  --data_dir data --device cuda --output_dir results/pvn_lbrl_balanced_prefix_ab_s1
+```
+
+The predeclared primary diagnostic is validation accuracy at the 12th slice
+(1.92 s), the longest complete prefix at or below 2 s for 40-sample slices.
+The comparison CSV also records `pvn_matched_prefix_accuracy` at that row:
+the same frozen full-window-pretrained PVN directly votes on the cropped
+480-sample input, without a GRU or later samples supplied to the encoder.
+This is an inference-only control, not a separately trained 1.92 s PVN.
+The same row records `pvn_segmented_prefix_accuracy`: pool point-level votes
+from the exact slice logits supplied to the GRU, excluding all later slices.
+The contiguous/segmented comparison isolates the difference between encoding
+one long prefix and encoding individual slices. The segmented vote and GRU
+share the same slice features but aggregate them differently.
+
+Use `--seeds 42 2024 3407 7 123 --scale 1` with a fresh output directory
+to repeat the corrected-scale experiment. The default MOABB zero-phase filter
+is unchanged, so observation times remain nominal offline times.

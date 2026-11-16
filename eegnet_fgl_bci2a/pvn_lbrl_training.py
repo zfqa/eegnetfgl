@@ -191,12 +191,19 @@ def uniform_rollout_mask(actions: torch.Tensor) -> torch.Tensor:
     return torch.cat((first, (actions[:, :-1] == PVNLBRL.WAIT).cumprod(1).bool()), dim=1)
 
 
+def balance_prefix_mask(observed: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    """Reassign the same number of targets per trial to uniformly sampled lengths."""
+    permutation = torch.rand(observed.shape, device=observed.device, generator=generator).argsort(1)
+    return torch.zeros_like(observed).scatter_(1, permutation, observed)
+
+
 def pretrain_belief(
     model: PVNLBRL, X: torch.Tensor, y: torch.Tensor,
     X_val: torch.Tensor, y_val: torch.Tensor, epochs: int = 300,
-    batch_size: int = 32, lr: float = 1e-3,
+    batch_size: int = 32, lr: float = 1e-3, *,
+    balanced_prefix_generator: torch.Generator | None = None,
 ) -> float | None:
-    """Frozen PVN; NLL at every observed slice (paper Eq. 7-8)."""
+    """Frozen PVN; NLL on random-rollout prefixes or matched balanced prefixes."""
     device = next(model.parameters()).device
     parameters = list(model.project.parameters()) + list(model.gru.parameters())
     parameters += list(model.belief_linear.parameters()) + list(model.belief_conv.parameters())
@@ -210,6 +217,8 @@ def pretrain_belief(
             encoded_batch = encoded_batch.to(device)
             actions = torch.randint(2, encoded_batch.shape[:2], device=device)
             observed = uniform_rollout_mask(actions)
+            if balanced_prefix_generator is not None:
+                observed = balance_prefix_mask(observed, balanced_prefix_generator)
             labels = y_batch.to(device)[:, None].expand_as(actions)
             # All observed non-initial slices have WAIT/0 as previous feedback.
             beliefs, _ = model.forward_encoded_sequence(encoded_batch)
