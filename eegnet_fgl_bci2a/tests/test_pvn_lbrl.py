@@ -399,3 +399,38 @@ def test_real_slice_encoder_cannot_see_past_the_matched_prefix(model) -> None:
         second = model.encode_sequence(changed)
     torch.testing.assert_close(first[:, :3], second[:, :3])
     assert not torch.allclose(first[:, 3:], second[:, 3:])
+
+
+def test_pvn_only_audit_votes_on_cumulative_prefixes_without_gru_or_test_scoring(
+    model, monkeypatch, tmp_path,
+) -> None:
+    import run_pvn_lbrl_ablation as runner
+
+    x = torch.randn(2, 3, 1000)
+    y = torch.zeros(2, dtype=torch.long)
+    fits, voted = [], []
+    monkeypatch.setattr(runner, "load_split", lambda *a: (x, y, x, y, None, None))
+    monkeypatch.setattr(runner, "PVNLBRL", lambda **kw: model)
+    monkeypatch.setattr(runner, "pretrain_encoder", lambda *a, **kw: fits.append(1))
+    for name in ("pretrain_belief", "train_policy", "evaluate"):
+        monkeypatch.setattr(runner, name, lambda *a, **kw: pytest.fail("PVN-only audit"))
+
+    def predict_vote(eeg):
+        voted.append(eeg.clone())
+        return torch.zeros(len(eeg), dtype=torch.long)
+
+    monkeypatch.setattr(model.encoder, "predict_vote", predict_vote)
+    monkeypatch.setattr(
+        "sys.argv", ["run_pvn_lbrl_ablation.py", "--audit_prefixes", "--audit_pvn_prefixes",
+                     "--no-full_training_session", "--device", "cpu",
+                     "--rl_steps", "0", "--belief_updates", "0"],
+    )
+    runner.run_subject(runner.parse_args(), 1, 42, tmp_path)
+    assert fits == [1]
+    assert [p.shape[-1] for p in voted] == list(range(40, 481, 40)) * 2
+    for prefix in voted:
+        torch.testing.assert_close(prefix, x[..., :prefix.shape[-1]])
+    curve = pd.read_csv(tmp_path / "subject_1_seed_42_pvn_prefix_curve.csv")
+    assert set(curve["split"]) == {"train", "val"}
+    assert len(curve) == 24 and (curve["accuracy"] == 1.0).all()
+    assert curve["observation_s"].max() == pytest.approx(1.92)

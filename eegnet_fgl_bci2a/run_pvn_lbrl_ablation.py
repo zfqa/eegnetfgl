@@ -48,9 +48,14 @@ def parse_args() -> argparse.Namespace:
         "--audit_prefixes", action="store_true",
         help="Write train/validation prefix accuracy before and after RL without evaluating the test session.",
     )
-    parser.add_argument(
+    variant = parser.add_mutually_exclusive_group()
+    variant.add_argument(
         "--compare_prefix_training", action="store_true",
         help="Compare random-HALT and budget-matched balanced GRU supervision in a pretraining-only audit.",
+    )
+    variant.add_argument(
+        "--audit_pvn_prefixes", action="store_true",
+        help="Fit only PVN, then vote on cumulative prefixes up to two seconds.",
     )
     parser.add_argument("--actors", type=int, default=8)
     parser.add_argument(
@@ -175,6 +180,27 @@ def prefix_audit(
     return rows
 
 
+@torch.no_grad()
+def pvn_prefix_curve(
+    model: PVNLBRL, X: torch.Tensor, y: torch.Tensor, batch_size: int, split: str,
+) -> list[dict[str, object]]:
+    model.eval()
+    device = next(model.parameters()).device
+    steps = min(2 * SAMPLE_RATE, X.shape[-1]) // model.slice_samples
+    hits = torch.zeros(steps, dtype=torch.long, device=device)
+    for x_batch, y_batch in zip(X.split(batch_size), y.split(batch_size)):
+        x_batch = x_batch[..., :steps * model.slice_samples].to(device)
+        y_batch = y_batch.to(device)
+        for i in range(steps):
+            prefix = x_batch[..., :(i + 1) * model.slice_samples]
+            hits[i] += (model.encoder.predict_vote(prefix) == y_batch).sum()
+    return [
+        {"split": split, "slices": step, "observation_s": step * model.slice_samples / SAMPLE_RATE,
+         "n_trials": len(y), "accuracy": count / len(y)}
+        for step, count in enumerate(hits.tolist(), 1)
+    ]
+
+
 def run_subject(args: argparse.Namespace, subject: int, seed: int, output_dir: Path) -> dict[str, object]:
     seed_all(seed)
     X_train, y_train, X_val, y_val, X_test, y_test = load_split(args, subject, seed)
@@ -191,6 +217,18 @@ def run_subject(args: argparse.Namespace, subject: int, seed: int, output_dir: P
     online_samples = complete_online_samples(X_train.shape[-1], args.slice_samples)
     train_online = X_train[..., :online_samples]
     val_online = X_val[..., :online_samples]
+    if args.audit_pvn_prefixes:
+        rows = []
+        for split, x, y in (("train", train_online, y_train), ("val", val_online, y_val)):
+            curve = pvn_prefix_curve(model, x, y, args.batch_size, split)
+            rows.extend(curve)
+            if split == "val":
+                scores = " ".join(f"{row['observation_s']:.2f}s={row['accuracy']:.4f}" for row in curve)
+                print(f"PVN validation | seed={seed} | {scores}", flush=True)
+        path = output_dir / f"subject_{subject}_seed_{seed}_pvn_prefix_curve.csv"
+        pd.DataFrame(rows).to_csv(path, index=False)
+        print(f"Saved PVN-only prefix curve: {path}", flush=True)
+        return {"dataset": args.dataset, "subject": subject, "seed": seed}
     audit_rows: list[dict[str, object]] = []
 
     def record_prefixes(candidate: PVNLBRL, stage: str) -> None:
@@ -326,6 +364,8 @@ def main() -> None:
         raise ValueError("Zero RL steps are only supported with --audit_prefixes")
     if args.compare_prefix_training and (not args.audit_prefixes or args.rl_steps != 0):
         raise ValueError("Use --audit_prefixes --rl_steps 0 for the prefix-training comparison")
+    if args.audit_pvn_prefixes and (not args.audit_prefixes or args.rl_steps != 0):
+        raise ValueError("Use --audit_prefixes --rl_steps 0 for the PVN-only prefix audit")
     if not 0 <= args.replay_warmup_epsilon <= 1:
         raise ValueError("replay_warmup_epsilon must be in [0, 1]")
     torch.set_num_threads(args.cpu_threads)
@@ -335,6 +375,8 @@ def main() -> None:
     config = {key: value for key, value in vars(args).items() if key != "output_dir"}
     if not args.audit_prefixes:
         config.pop("audit_prefixes")
+    if not args.audit_pvn_prefixes:
+        config.pop("audit_pvn_prefixes")
     if not args.compare_prefix_training:
         config.pop("compare_prefix_training")
     else:

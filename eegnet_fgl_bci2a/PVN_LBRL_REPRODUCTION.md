@@ -184,3 +184,11 @@ share the same slice features but aggregate them differently.
 Use `--seeds 42 2024 3407 7 123 --scale 1` with a fresh output directory
 to repeat the corrected-scale experiment. The default MOABB zero-phase filter
 is unchanged, so observation times remain nominal offline times.
+
+For a cumulative PVN baseline without GRU or RL, replace
+`--compare_prefix_training` with `--audit_pvn_prefixes` and use a new
+output directory. This fits the PVN once per subject/seed, then applies the
+same frozen PVN directly to each cumulative prefix up to 2 s. At 40 samples
+per slice, the output `subject_*_seed_*_pvn_prefix_curve.csv` contains 12
+points per split, including 0.48, 0.96, 1.44, and 1.92 s.
+The audit scores training/validation only and does not select an exit threshold.
