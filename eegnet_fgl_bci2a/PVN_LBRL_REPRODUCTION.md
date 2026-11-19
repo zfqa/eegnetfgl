@@ -192,3 +192,31 @@ same frozen PVN directly to each cumulative prefix up to 2 s. At 40 samples
 per slice, the output `subject_*_seed_*_pvn_prefix_curve.csv` contains 12
 points per split, including 0.48, 0.96, 1.44, and 1.92 s.
 The audit scores training/validation only and does not select an exit threshold.
+
+## Threshold stopping comparator (not PVN-LBRL reproduction)
+
+`run_pvn_threshold_baseline.py` fits the same 4 s PVN on the 80% training
+split and uses only the 20% training-session validation split to choose a
+point-vote-share threshold. The six allowed endpoints are fixed at 1.12,
+1.28, 1.44, 1.60, 1.76, and 1.92 s. Vote share is not a calibrated probability.
+Candidates are 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, and 0.99, plus an always-wait
+fixed-window fallback. Among candidates with validation accuracy at least
+that of the fixed window, select minimum mean observation time, then greater
+accuracy, then greater threshold (fixed wins an exact tie).
+
+Both policies use the exact same frozen PVN. The selected rule and weights
+are saved before the evaluation-session labels are scored. At inference only
+unresolved trials are evaluated, each on the current cumulative prefix.
+The final endpoint forces classification. Outputs include per-trial labels,
+predictions and observation times, confusion matrices, and seed-level metrics.
+No GRU, Q learner, teachers, or RL rewards are changed by this comparator.
+The MOABB zero-phase filter, 1-48 Hz band, and microvolt scale remain unchanged.
+Time is nominal offline observation time, not causal online latency.
+Validation selection is exploratory and does not guarantee test noninferiority.
+The earlier audit did not save PVN weights, so this runner must refit PVN.
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python -u run_pvn_threshold_baseline.py \
+  --subjects 1 --seeds 42 2024 3407 7 123 --data_dir data --device cuda \
+  --epochs_pvn 300 --output_dir results/pvn_threshold_s1_server
+```
