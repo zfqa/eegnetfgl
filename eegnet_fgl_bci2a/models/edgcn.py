@@ -87,6 +87,8 @@ class StructureAwareSpatialEmbedding(nn.Module):
 class EDGCNStudent(nn.Module):
     """EDGCN components with a fixed two-second, per-trial inference contract."""
 
+    window_seconds = 2
+
     def __init__(
         self, n_channels: int, n_samples: int, n_classes: int = 4,
         sfreq: int = 250, embedding_dim: int = 16, hidden_dim: int = 16,
@@ -94,13 +96,15 @@ class EDGCNStudent(nn.Module):
         orth_weight: float = 0.01,
     ) -> None:
         super().__init__()
-        if n_samples != 2 * sfreq:
-            raise ValueError(f"EDGCN student requires exactly 2s ({2 * sfreq} samples), got {n_samples}")
+        if n_samples != self.window_seconds * sfreq:
+            raise ValueError(f"EDGCN requires exactly {self.window_seconds}s "
+                             f"({self.window_seconds * sfreq} samples), got {n_samples}")
         if cheb_order < 1:
             raise ValueError("cheb_order must be positive")
         if orth_weight <= 0:
             raise ValueError("orth_weight must be positive")
         self.n_channels = n_channels
+        self.n_samples = n_samples
         self.cheb_order = cheb_order
         self.primary = nn.Conv2d(1, 10, (1, 5), padding=(0, 2), bias=False)
         self.cheap = nn.Conv2d(10, 10, (1, 3), padding=(0, 1), groups=10, bias=False)
@@ -146,7 +150,7 @@ class EDGCNStudent(nn.Module):
             terms.append(2 * support @ terms[-1] - terms[-2])
         return torch.cat(terms, dim=-1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def graph_features(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if x.ndim == 4:
             if x.shape[1] != 1:
                 raise ValueError("Expected [batch, 1, channels, samples]")
@@ -156,8 +160,8 @@ class EDGCNStudent(nn.Module):
             x = x.unsqueeze(1)
         else:
             raise ValueError("Expected [batch, channels, samples] or [batch, 1, channels, samples]")
-        if raw.shape[1:] != (self.n_channels, self.temporal_embedding.sfreq * 2):
-            raise ValueError("EDGCN input shape does not match its two-second configuration")
+        if raw.shape[1:] != (self.n_channels, self.n_samples):
+            raise ValueError("EDGCN input shape does not match its configured window")
         temporal = self.temporal_embedding(raw)
         spatial, graph = self.spatial_embedding(raw)
         propagated = self._chebyshev(graph, self._node_features(x))
@@ -167,6 +171,10 @@ class EDGCNStudent(nn.Module):
         spatial_out = torch.einsum("bck,bckh->bch", propagated, spatial_weight)
         temporal_out = temporal_out + (temporal @ self.temporal_bias).unsqueeze(1)
         spatial_out = spatial_out + torch.einsum("bcd,dh->bch", spatial, self.spatial_bias)
+        return temporal_out, spatial_out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        temporal_out, spatial_out = self.graph_features(x)
         features = torch.cat((temporal_out.mean(dim=1), spatial_out.mean(dim=1)), dim=-1)
         return self.classifier(F.elu(features))
 
