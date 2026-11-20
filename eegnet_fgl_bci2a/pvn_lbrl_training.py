@@ -202,6 +202,8 @@ def pretrain_belief(
     X_val: torch.Tensor, y_val: torch.Tensor, epochs: int = 300,
     batch_size: int = 32, lr: float = 1e-3, *,
     balanced_prefix_generator: torch.Generator | None = None,
+    supervision_counts: torch.Tensor | None = None,
+    supervision_budgets: list | None = None,
 ) -> float | None:
     """Frozen PVN; NLL on random-rollout prefixes or matched balanced prefixes."""
     device = next(model.parameters()).device
@@ -219,6 +221,10 @@ def pretrain_belief(
             observed = uniform_rollout_mask(actions)
             if balanced_prefix_generator is not None:
                 observed = balance_prefix_mask(observed, balanced_prefix_generator)
+            if supervision_counts is not None:
+                supervision_counts.add_(observed.sum(0).to(supervision_counts.device))
+            if supervision_budgets is not None:
+                supervision_budgets.append(observed.sum(1).cpu().tolist())
             labels = y_batch.to(device)[:, None].expand_as(actions)
             # All observed non-initial slices have WAIT/0 as previous feedback.
             beliefs, _ = model.forward_encoded_sequence(encoded_batch)
